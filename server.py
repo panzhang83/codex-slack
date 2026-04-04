@@ -132,7 +132,12 @@ def is_reset_command(text):
 
 def is_fresh_command(text):
     normalized = (text or "").strip()
-    return normalized.startswith("/fresh ") or normalized == "/fresh"
+    return (
+        normalized.startswith("/fresh ")
+        or normalized == "/fresh"
+        or normalized.startswith("fresh ")
+        or normalized == "fresh"
+    )
 
 
 def is_session_command(text):
@@ -140,12 +145,43 @@ def is_session_command(text):
     return normalized in {"/session", "session", "session id"}
 
 
+def is_status_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/where", "where", "/whoami", "whoami", "/status", "status"}
+
+
+def is_handoff_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/handoff", "handoff"}
+
+
+def is_recap_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/recap", "recap"}
+
+
+def is_attach_command(text):
+    normalized = (text or "").strip()
+    return normalized.startswith("/attach ") or normalized.startswith("attach ")
+
+
+def strip_attach_command(text):
+    normalized = (text or "").strip()
+    if normalized.startswith("/attach "):
+        return normalized[len("/attach ") :].strip()
+    if normalized.startswith("attach "):
+        return normalized[len("attach ") :].strip()
+    return ""
+
+
 def strip_fresh_command(text):
     normalized = (text or "").strip()
-    if normalized == "/fresh":
+    if normalized in {"/fresh", "fresh"}:
         return ""
     if normalized.startswith("/fresh "):
         return normalized[len("/fresh ") :].strip()
+    if normalized.startswith("fresh "):
+        return normalized[len("fresh ") :].strip()
     return normalized
 
 
@@ -158,6 +194,20 @@ def get_codex_settings():
     extra_args = ENV.get("CODEX_EXTRA_ARGS", "").strip()
     full_auto = ENV.get("CODEX_FULL_AUTO", "0") == "1"
     return codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto
+
+
+def get_allowed_slack_user_ids():
+    raw = ENV.get("ALLOWED_SLACK_USER_IDS", "").strip()
+    if not raw:
+        return set()
+    return {part.strip() for part in re.split(r"[\s,]+", raw) if part.strip()}
+
+
+def is_allowed_slack_user(user_id):
+    allowed_user_ids = get_allowed_slack_user_ids()
+    if not allowed_user_ids:
+        return True
+    return user_id in allowed_user_ids
 
 
 def build_codex_exec_args(prompt, output_file):
@@ -256,6 +306,62 @@ def read_output_file(path):
     return output_path.read_text(encoding="utf-8").strip()
 
 
+def build_handoff_prompt():
+    return (
+        "请基于当前这个 session 已有的对话上下文，生成一份简短的 handoff note，供用户在终端和 Slack 之间切换控制时直接接力。\n\n"
+        "硬性要求:\n"
+        "- 不要运行工具\n"
+        "- 不要读取文件\n"
+        "- 不要改代码\n"
+        "- 只根据当前 session 里已经存在的上下文作答\n"
+        "- 用中文回答\n"
+        "- 尽量简短但信息完整\n\n"
+        "输出格式严格使用下面这几个小节:\n"
+        "Current Goal:\n"
+        "Constraints:\n"
+        "Working Dir:\n"
+        "Session State:\n"
+        "Suggested Next Message:\n\n"
+        "如果某一项不明确，就明确写“不明确”，不要编造。"
+    )
+
+
+def build_recap_prompt():
+    return (
+        "请基于当前这个 session 已有的对话上下文，生成一份简短的进展 recap，方便用户在手机 Slack 上快速回顾最近状态。\n\n"
+        "硬性要求:\n"
+        "- 不要运行工具\n"
+        "- 不要读取文件\n"
+        "- 不要改代码\n"
+        "- 只根据当前 session 里已经存在的上下文作答\n"
+        "- 用中文回答\n"
+        "- 尽量简短但信息完整\n\n"
+        "输出格式严格使用下面这几个小节:\n"
+        "Recent Progress:\n"
+        "Current Constraints:\n"
+        "Open Questions:\n"
+        "Suggested Next Message:\n\n"
+        "如果某一项不明确，就明确写“不明确”，不要编造。"
+    )
+
+
+def append_handoff_footer(text, session_id, workdir):
+    base = (text or "").strip()
+    footer = (
+        "\n\nTerminal Verify Command:\n"
+        "`printenv CODEX_THREAD_ID && pwd`\n"
+        f"Expected Session ID: `{session_id or '-'}`\n"
+        f"Expected Workdir: `{workdir}`"
+    )
+    return (base + footer).strip()
+
+
+def append_recap_footer(text, session_id):
+    base = (text or "").strip()
+    footer = f"\n\nCurrent Session ID: `{session_id or '-'}`"
+    return (base + footer).strip()
+
+
 def parse_codex_json_events(text):
     session_id = None
     messages = []
@@ -325,6 +431,16 @@ def run_codex(prompt, session_id=None):
 
     parsed_session_id, json_output = parse_codex_json_events(raw_output)
     effective_session_id = parsed_session_id or session_id
+    if session_id:
+        if parsed_session_id and parsed_session_id != session_id:
+            print(
+                "[session_drift]"
+                f" requested_session_id={session_id}"
+                f" parsed_session_id={parsed_session_id}"
+                " action=preserve_requested",
+                flush=True,
+            )
+        effective_session_id = session_id
     cleaned_output = clean_codex_output(raw_output)
     exit_code = child.exitstatus if child.exitstatus is not None else child.signalstatus
     log_codex_result(mode, exit_code, raw_output, final_output)
@@ -390,6 +506,110 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
 
         lock = get_thread_lock(thread_key)
         with lock:
+            if is_handoff_command(prompt):
+                current_session_id = SESSION_STORE.get(thread_key)
+                if not current_session_id:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法生成 handoff note。",
+                    )
+                    return
+
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f"<@{user_id}> 正在基于当前 session 整理 handoff note，请稍等。",
+                )
+                _codex_bin, _model, workdir, _timeout, _sandbox, _extra_args, _full_auto = get_codex_settings()
+                next_session_id, result = run_codex(
+                    build_handoff_prompt(),
+                    session_id=current_session_id,
+                )
+                result = append_handoff_footer(result, next_session_id or current_session_id, workdir)
+                print(
+                    "[codex_result]"
+                    f" thread_key={thread_key}"
+                    f" handoff=1"
+                    f" result_length={len(result or '')}",
+                    flush=True,
+                )
+                if next_session_id and next_session_id != current_session_id:
+                    SESSION_STORE.set(thread_key, next_session_id)
+                elif next_session_id:
+                    SESSION_STORE.touch(thread_key)
+                log_session_event(
+                    "handoff",
+                    thread_key,
+                    existing_session_id=current_session_id,
+                    next_session_id=next_session_id,
+                )
+                post_chunks(client, channel, thread_ts, result)
+                return
+
+            if is_recap_command(prompt):
+                current_session_id = SESSION_STORE.get(thread_key)
+                if not current_session_id:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法生成 recap。",
+                    )
+                    return
+
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f"<@{user_id}> 正在整理当前 session 的 recap，请稍等。",
+                )
+                next_session_id, result = run_codex(
+                    build_recap_prompt(),
+                    session_id=current_session_id,
+                )
+                result = append_recap_footer(result, next_session_id or current_session_id)
+                print(
+                    "[codex_result]"
+                    f" thread_key={thread_key}"
+                    f" recap=1"
+                    f" result_length={len(result or '')}",
+                    flush=True,
+                )
+                if next_session_id and next_session_id != current_session_id:
+                    SESSION_STORE.set(thread_key, next_session_id)
+                elif next_session_id:
+                    SESSION_STORE.touch(thread_key)
+                log_session_event(
+                    "recap",
+                    thread_key,
+                    existing_session_id=current_session_id,
+                    next_session_id=next_session_id,
+                )
+                post_chunks(client, channel, thread_ts, result)
+                return
+
+            if is_status_command(prompt):
+                current_session_id = SESSION_STORE.get(thread_key)
+                codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto = get_codex_settings()
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=(
+                        f"<@{user_id}> 当前 Slack thread 的运行状态:\n\n"
+                        f"- thread_key: `{thread_key}`\n"
+                        f"- session_id: `{current_session_id or '-'}`\n"
+                        f"- model: `{model}`\n"
+                        f"- workdir: `{workdir}`\n"
+                        f"- sandbox: `{sandbox or '-'}`\n"
+                        f"- timeout_seconds: `{timeout}`\n"
+                        f"- codex_bin: `{codex_bin}`\n"
+                        f"- full_auto: `{1 if full_auto else 0}`\n"
+                        f"- extra_args: `{extra_args or '-'}`\n"
+                        f"- session_store: `{SESSION_STORE_PATH}`\n\n"
+                        "如果你想让终端继续同一个会话，可以在终端里使用这个 `session_id` 执行 `codex exec resume ...`。"
+                    ),
+                )
+                return
+
             if is_session_command(prompt):
                 current_session_id = SESSION_STORE.get(thread_key)
                 client.chat_postMessage(
@@ -399,6 +619,35 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         f"<@{user_id}> 当前 Slack thread 的 Codex session id: `{current_session_id}`"
                         if current_session_id
                         else f"<@{user_id}> 当前 Slack thread 还没有 Codex session。"
+                    ),
+                )
+                return
+
+            if is_attach_command(prompt):
+                attach_session_id = strip_attach_command(prompt)
+                if not attach_session_id:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text="请用 `attach <session_id>` 绑定一个已有的 Codex 会话。",
+                    )
+                    return
+
+                previous_session_id = SESSION_STORE.get(thread_key)
+                SESSION_STORE.set(thread_key, attach_session_id)
+                log_session_event(
+                    "attach",
+                    thread_key,
+                    existing_session_id=previous_session_id,
+                    next_session_id=attach_session_id,
+                )
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=(
+                        f"<@{user_id}> 当前 Slack thread 已绑定到 Codex session `{attach_session_id}`。\n\n"
+                        "后续你在这个 thread 里发送的普通消息会继续这个会话。"
+                        " 为避免上下文冲突，请不要同时在终端和 Slack 两边并发操作同一个 session。"
                     ),
                 )
                 return
@@ -517,6 +766,24 @@ def build_app():
         signing_secret=ENV.get("SLACK_SIGNING_SECRET", ""),
     )
 
+    @app.use
+    def log_incoming_events(logger, body, next):
+        event = (body or {}).get("event", {})
+        text = (event.get("text") or "").replace("\n", "\\n")
+        if len(text) > 200:
+            text = text[:200] + "...<truncated>"
+        print(
+            "[slack_event]"
+            f" type={event.get('type', '-')}"
+            f" channel_type={event.get('channel_type', '-')}"
+            f" subtype={event.get('subtype', '-')}"
+            f" user={event.get('user', '-')}"
+            f" channel={event.get('channel', '-')}"
+            f" text={json.dumps(text, ensure_ascii=True)}",
+            flush=True,
+        )
+        next()
+
     @app.event("app_mention")
     def handle_app_mention(body, client, logger):
         event = body.get("event", {})
@@ -527,6 +794,14 @@ def build_app():
         channel = event["channel"]
         thread_ts = event.get("thread_ts") or event["ts"]
         user_id = event.get("user", "")
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected app_mention from unauthorized user %s", user_id)
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f"<@{user_id}> 你没有权限使用这个 Codex bot。",
+            )
+            return
         logger.info("Handling app_mention in channel %s", channel)
         start_background_job(client, channel, thread_ts, prompt, user_id)
 
@@ -542,6 +817,14 @@ def build_app():
         channel = event["channel"]
         thread_ts = event.get("thread_ts") or event["ts"]
         user_id = event.get("user", "")
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected direct message from unauthorized user %s", user_id)
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text="你没有权限使用这个 Codex bot。",
+            )
+            return
         logger.info("Handling direct message in channel %s", channel)
         start_background_job(client, channel, thread_ts, prompt, user_id)
 

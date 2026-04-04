@@ -1,7 +1,10 @@
 .env
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.swp
 .codex-slack-sessions.json
+.codex-slack.log
+.serena/
 server.log

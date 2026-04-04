@@ -16,7 +16,7 @@
 - 同一个 Slack thread 会继续复用同一个 Codex session
 - 支持把 Codex 长输出分片发送
 - 优先只发送 Codex 的最终答复，尽量不把中间进度和思考日志发到 Slack
-- 支持 `/reset`、`/fresh`、`/session` 控制当前 Slack thread 的 Codex session
+- 支持 `/reset`、`reset`、`/fresh`、`fresh`、`/session`、`session`、`/attach`、`attach`、`/where`、`where`、`/whoami`、`whoami`、`/status`、`status`、`/handoff`、`handoff`、`/recap`、`recap` 控制当前 Slack thread 的 Codex session
 
 ## 启动
 
@@ -40,6 +40,7 @@ OPENAI_MODEL=gpt-5.4
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 SLACK_SIGNING_SECRET=你的_slack_signing_secret
+ALLOWED_SLACK_USER_IDS=U0123456789,U0987654321
 
 CODEX_BIN=codex
 CODEX_WORKDIR=/ssd/home/pz
@@ -47,11 +48,13 @@ CODEX_TIMEOUT_SECONDS=900
 CODEX_SANDBOX=danger-full-access
 CODEX_FULL_AUTO=0
 CODEX_EXTRA_ARGS=
-CODEX_SLACK_SESSION_STORE=/ssd/home/pz/codex-slack/.codex-slack-sessions.json
+CODEX_SLACK_SESSION_STORE=/path/to/codex-slack/.codex-slack-sessions.json
 ```
 
 说明:
 
+- `ALLOWED_SLACK_USER_IDS` 留空表示不限制；如果填写，则只有这些 Slack `user_id` 可以使用 bot
+- 多个 Slack `user_id` 用英文逗号分隔
 - GPU/驱动相关命令不要依赖 `--full-auto`
 - 当前 `codex` 在 `--full-auto` 下可能实际退回 `workspace-write` sandbox
 - 需要访问 `nvidia-smi` 这类宿主机资源时，优先显式设置 `CODEX_SANDBOX=danger-full-access`
@@ -112,9 +115,15 @@ python3 server.py
 
 当前这个项目的最小可用集合仍然是:
 
-- `app_mentions:read`
 - `chat:write`
 - `im:history`
+
+如果你的目标只是“通过手机私聊控制 Codex”，那么:
+
+- `chat:write`
+- `im:history`
+
+就已经够用，`app_mentions:read` 不是必须。
 
 5. 开启事件订阅
 
@@ -165,6 +174,7 @@ python3 server.py
 SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 SLACK_SIGNING_SECRET=...
+ALLOWED_SLACK_USER_IDS=U0123456789
 ```
 
 11. 启动并验证
@@ -225,7 +235,7 @@ python3 server.py
 - 之后这个 thread 里的后续回复，会继续 `resume` 这个 thread 自己的 Codex session
 - 不同 thread 之间不会共享上下文、不会共享 session id、不会互相污染历史
 - 私聊场景里，每一条独立私聊消息如果没有复用同一个 `thread_ts`，也会被当成不同 thread；如果是在同一个私聊 thread 下继续回复，则会复用同一个 session
-- 服务会把 `thread_key -> session_id` 记录到 [`.codex-slack-sessions.json`](/ssd/home/pz/codex-slack/.codex-slack-sessions.json)
+- 服务会把 `thread_key -> session_id` 记录到本地的 `.codex-slack-sessions.json`
 - 这个文件是本地缓存，所以 `server.py` 重启后，已有 thread 仍然可以继续找到对应的 session id
 - 同一个 thread 内部会串行处理消息，避免并发 `resume` 导致上下文顺序错乱
 - 如果某个 thread 的旧 session 恢复失败，服务会只丢弃这个 thread 的 session，并自动为这个 thread 重建新会话
@@ -235,6 +245,27 @@ python3 server.py
 - `/reset`：清掉当前 thread 的 Codex session，下条消息会新建 session
 - `/fresh 你的任务`：忽略当前 thread 旧 session，这条消息强制新建一个 session，并把它设为当前 thread 的新 session
 - `/session`：返回当前 thread 正在使用的 Codex session id
+- `/attach <session_id>`：把当前 Slack thread 绑定到一个已有的 Codex session
+- `/where` / `/whoami` / `/status`：返回当前 thread 绑定的 `session_id`、`workdir`、模型等运行状态
+- `/handoff`：基于当前 session 的已有上下文，生成一份适合跨端接力的短版 handoff note，并附带终端核验命令
+- `/recap`：基于当前 session 的已有上下文，生成一份简短的最近进展总结
+- `reset`：和 `/reset` 等价，适合手机里直接发普通文本
+- `fresh 你的任务`：和 `/fresh 你的任务` 等价，适合手机里直接发普通文本
+- `session`：和 `/session` 等价，适合手机里直接发普通文本
+- `attach <session_id>`：和 `/attach <session_id>` 等价，适合手机里直接发普通文本
+- `where` / `whoami` / `status`：和带斜杠版本等价，适合手机里直接发普通文本
+- `handoff`：和 `/handoff` 等价，适合手机里直接发普通文本
+- `recap`：和 `/recap` 等价，适合手机里直接发普通文本
+
+手机里最稳的用法:
+
+- 私聊 bot 时，直接发送普通文本，不要在私聊里再写 `@bot`
+- 例如直接发 `session`
+- 如果你想快速确认当前 thread 到底绑定了哪个会话、跑在哪个目录，直接发 `where`
+- 如果你想接管一个终端里已有的 Codex 会话，先拿到它的 `session id`，再在 Slack 里发 `attach <session_id>`
+- 如果你准备把控制权从终端切到手机，或者从手机切回终端，先发 `handoff` 生成一份短版交接说明会更稳
+- 如果你只是想在手机上快速回顾当前进展，不需要完整交接说明，直接发 `recap`
+- 例如直接发 `fresh 到你的目标项目目录里总结一下当前状态`
 
 可以用下面的例子理解：
 
