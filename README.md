@@ -261,14 +261,14 @@ python3 server.py
 - `/reset`：清掉当前 thread 的 Codex session，下条消息会新建 session
 - `/fresh 你的任务`：忽略当前 thread 旧 session，这条消息强制新建一个 session，并把它设为当前 thread 的新 session
 - `/session`：返回当前 thread 正在使用的 Codex session id
-- `/attach <session_id>`：把当前 Slack thread 绑定到一个已有的 Codex session；默认只允许单用户白名单 attach 未见过的 session，多用户共享 attach 需要显式开启 `ALLOW_SHARED_ATTACH=1`
+- `/attach <session_id>`：把当前 Slack thread 绑定到一个已有的 Codex session；默认只允许单用户白名单 attach 未见过的 session，多用户共享 attach 需要显式开启 `ALLOW_SHARED_ATTACH=1`。如果你在终端里要先查询当前 Codex session id，优先运行 `printenv CODEX_THREAD_ID`；如果你想同时核对 session id 和当前工作目录，运行 `printenv CODEX_THREAD_ID && pwd`
 - `/where` / `/whoami` / `/status`：返回当前 thread 绑定的 `session_id`、`workdir`、模型等运行状态
 - `/handoff`：基于当前 session 的已有上下文，生成一份适合跨端接力的短版 handoff note，并附带终端核验命令
 - `/recap`：基于当前 session 的已有上下文，生成一份简短的最近进展总结
 - `reset`：和 `/reset` 等价，适合手机里直接发普通文本
 - `fresh 你的任务`：和 `/fresh 你的任务` 等价，适合手机里直接发普通文本
 - `session`：和 `/session` 等价，适合手机里直接发普通文本
-- `attach <session_id>`：和 `/attach <session_id>` 等价，适合手机里直接发普通文本
+- `attach <session_id>`：和 `/attach <session_id>` 等价，适合手机里直接发普通文本；终端侧 session id 的查询命令同上
 - `where` / `whoami` / `status`：和带斜杠版本等价，适合手机里直接发普通文本
 - `handoff`：和 `/handoff` 等价，适合手机里直接发普通文本
 - `recap`：和 `/recap` 等价，适合手机里直接发普通文本
