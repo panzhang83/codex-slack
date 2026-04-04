@@ -58,6 +58,8 @@ CODEX_SLACK_SESSION_STORE=/path/to/codex-slack/.codex-slack-sessions.json
 
 - `ALLOWED_SLACK_USER_IDS` 留空表示不限制；如果填写，则只有这些 Slack `user_id` 可以使用 bot
 - 多个 Slack `user_id` 用英文逗号分隔
+- 获取你自己的 Slack `user_id`：在 Slack 桌面版或网页版打开个人资料，点击右上角 `⋯`，选择 `Copy member ID`
+- 配白名单时要填“你的成员 ID”，不要误填 bot 自己的 `user_id`
 - 系统环境变量的优先级高于 `.env` 里的同名变量；如果两边都设置了同一个 key，会优先使用进程环境变量
 - `ALLOW_SHARED_ATTACH=0` 是更安全的默认值；只有在“单用户白名单”模式下，才允许把一个尚未被 bot 见过的终端 session 直接 `attach` 进来
 - 如果你明确需要多用户共享 `attach`，再显式设置 `ALLOW_SHARED_ATTACH=1`
