@@ -1,3 +1,2 @@
-pexpect>=4.9.0,<5
 slack-bolt>=1.23.0,<2
 codex-app-server-sdk>=0.3

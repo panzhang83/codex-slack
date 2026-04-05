@@ -3,7 +3,7 @@
 一个面向本机 Codex CLI 的最小 Slack 桥接服务：
 
 - Slack 通过 Socket Mode 把消息推给本机 `server.py`
-- `server.py` 用 `pexpect` 调用本机 `codex exec`
+- `server.py` 用本机 `codex exec --json` 流式调用 Codex CLI
 - `watch` 会把当前 Codex session 的 thread 对话同步到 Slack，方便在手机端旁路观察
 
 ## 当前能力
@@ -38,7 +38,6 @@ pip install -r requirements.txt
 当前依赖里包含：
 
 - `slack-bolt`
-- `pexpect`
 - `codex-app-server-sdk>=0.3`
 
 3. 填写 `.env`
@@ -60,6 +59,8 @@ CODEX_FULL_AUTO=0
 CODEX_EXTRA_ARGS=
 CODEX_SLACK_SESSION_STORE=/path/to/codex-slack/.codex-slack-sessions.json
 CODEX_SLACK_WATCH_POLL_SECONDS=5
+CODEX_PROGRESS_HEARTBEAT_SECONDS=300
+CODEX_PROGRESS_POLL_SECONDS=15
 # CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES=33554432
 ```
 
@@ -71,7 +72,10 @@ CODEX_SLACK_WATCH_POLL_SECONDS=5
 - 单用户白名单模式下，允许直接 `attach` 一个尚未被 bot 见过的 session
 - 多用户共享 `attach` 需要显式设置 `ALLOW_SHARED_ATTACH=1`
 - 即使开启 `ALLOW_SHARED_ATTACH=1`，一旦某个 Slack thread 或 session 已经绑定给某个 Slack 用户，其他白名单用户也不能接管
+- `CODEX_TIMEOUT_SECONDS=0` 表示不设执行超时上限；适合超长任务
 - `CODEX_SLACK_WATCH_POLL_SECONDS` 控制持续 watch 的轮询间隔，默认 5 秒
+- `CODEX_PROGRESS_HEARTBEAT_SECONDS` 控制长任务 heartbeat 间隔，默认 300 秒
+- `CODEX_PROGRESS_POLL_SECONDS` 控制长任务 progress 轮询间隔，默认 15 秒
 - `CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES` 可选，用于在 thread 很长时提高 app-server `thread/read` 的 stdio 行缓冲上限
 - 系统环境变量优先级高于 `.env`
 
@@ -187,6 +191,7 @@ watch
 - 当前 Slack thread 处于 `control` 模式时，不再启动 `watch`；因为后续回复本来就会直接发到这个 thread，继续镜像只会造成重复消息
 - `watch` 首次会回放最近一轮已完成的可显示对话；如果当前最新 turn 还没出 `final_answer`，会等后续增量推送
 - 后续只推送新出现的用户消息和 agent `final_answer`
+- 对于 `control` 模式下的长任务，服务会在运行期间定时发送 heartbeat；一旦服务拿到当前 session id，就会基于官方 thread turns 推送一部分中间 progress 更新
 - 为了和普通说明消息区分，镜像对话会用 `*User*` / `*Codex*` 标题加引用块样式发送到 Slack
 - 如果 `server.py` 重启了，session 绑定仍然保留，但正在运行的 `watch` 不会自动恢复；需要你在同一个 Slack thread 里重新发一次 `watch`
 - 如果 `watch` 因为读取失败或对话锚点失效而停止，直接重新发送一次 `watch` 即可重建镜像

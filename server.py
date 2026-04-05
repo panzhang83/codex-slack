@@ -2,8 +2,10 @@ import atexit
 import asyncio
 import json
 import os
+import queue
 import re
 import shlex
+import subprocess
 import tempfile
 import threading
 import time
@@ -19,7 +21,6 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-import pexpect
 try:
     from codex_app_server_sdk import CodexClient
     from codex_app_server_sdk.transport import CodexTransportError, StdioTransport
@@ -70,6 +71,8 @@ INSTANCE_LOCK_HANDLE = None
 SESSION_MODE_OBSERVE = "observe"
 SESSION_MODE_CONTROL = "control"
 DEFAULT_WATCH_POLL_SECONDS = 5
+DEFAULT_PROGRESS_HEARTBEAT_SECONDS = 300
+DEFAULT_PROGRESS_POLL_SECONDS = 15
 MAX_APP_SERVER_RETRIES = 2
 MAX_WATCH_READ_FAILURES = 2
 DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES = 32 * 1024 * 1024
@@ -254,6 +257,14 @@ class ConversationEvent:
     turn_id: str
     item_id: str
     role: str
+    text: str
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    turn_id: str
+    item_id: str
+    phase: str
     text: str
 
 
@@ -445,6 +456,24 @@ def get_watch_poll_seconds():
     return max(1, value)
 
 
+def get_progress_heartbeat_seconds():
+    raw = str(ENV.get("CODEX_PROGRESS_HEARTBEAT_SECONDS", DEFAULT_PROGRESS_HEARTBEAT_SECONDS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_PROGRESS_HEARTBEAT_SECONDS
+    return max(1, value)
+
+
+def get_progress_poll_seconds():
+    raw = str(ENV.get("CODEX_PROGRESS_POLL_SECONDS", DEFAULT_PROGRESS_POLL_SECONDS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_PROGRESS_POLL_SECONDS
+    return max(1, value)
+
+
 def get_allowed_slack_user_ids():
     raw = ENV.get("ALLOWED_SLACK_USER_IDS", "").strip()
     if not raw:
@@ -601,6 +630,17 @@ def clean_codex_output(text):
     return cleaned
 
 
+def format_elapsed_seconds(total_seconds):
+    seconds = max(0, int(total_seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 def read_output_file(path):
     output_path = Path(path)
     if not output_path.exists():
@@ -677,32 +717,62 @@ class CodexRunResult:
     timed_out: bool
 
 
+class SessionIdTracker:
+    def __init__(self, session_id=None):
+        self._lock = threading.Lock()
+        self._session_id = session_id
+
+    def set(self, session_id):
+        if not session_id:
+            return
+        with self._lock:
+            self._session_id = session_id
+
+    def get(self):
+        with self._lock:
+            return self._session_id
+
+
+def parse_codex_json_event_line(line):
+    stripped = (line or "").strip()
+    if not stripped:
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
+def process_codex_json_event(event, parsed_session_id, messages, session_id_tracker=None):
+    if not isinstance(event, dict):
+        return parsed_session_id
+
+    event_type = event.get("type")
+    if event_type == "thread.started":
+        next_session_id = event.get("thread_id") or parsed_session_id
+        if session_id_tracker and next_session_id:
+            session_id_tracker.set(next_session_id)
+        return next_session_id
+
+    if event_type != "item.completed":
+        return parsed_session_id
+
+    item = event.get("item") or {}
+    if item.get("type") != "agent_message":
+        return parsed_session_id
+
+    message_text = item.get("text")
+    if message_text:
+        messages.append(message_text)
+    return parsed_session_id
+
+
 def parse_codex_json_events(text):
     session_id = None
     messages = []
 
     for line in (text or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            event = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-
-        event_type = event.get("type")
-        if event_type == "thread.started":
-            session_id = event.get("thread_id") or session_id
-        if event_type != "item.completed":
-            continue
-
-        item = event.get("item") or {}
-        if item.get("type") != "agent_message":
-            continue
-
-        message_text = item.get("text")
-        if message_text:
-            messages.append(message_text)
+        session_id = process_codex_json_event(parse_codex_json_event_line(line), session_id, messages)
 
     return session_id, "\n\n".join(messages).strip()
 
@@ -716,7 +786,77 @@ def build_codex_child_env():
     return child_env
 
 
-def run_codex(prompt, session_id=None):
+def stream_codex_json_output(process, timeout, session_id_tracker=None):
+    start_monotonic = time.monotonic()
+    line_queue = queue.Queue()
+    raw_lines = []
+    parsed_session_id = session_id_tracker.get() if session_id_tracker else None
+    agent_messages = []
+
+    def reader():
+        try:
+            stdout = process.stdout
+            if stdout is None:
+                return
+            for line in stdout:
+                line_queue.put(line)
+        finally:
+            line_queue.put(None)
+
+    def ingest_queue_line(line):
+        nonlocal parsed_session_id
+        raw_lines.append(line)
+        parsed_session_id = process_codex_json_event(
+            parse_codex_json_event_line(line),
+            parsed_session_id,
+            agent_messages,
+            session_id_tracker=session_id_tracker,
+        )
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+
+    timed_out = False
+    try:
+        while True:
+            try:
+                line = line_queue.get(timeout=1)
+            except queue.Empty:
+                if timeout and timeout > 0 and (time.monotonic() - start_monotonic) >= timeout:
+                    timed_out = True
+                    with suppress(Exception):
+                        process.kill()
+                    break
+                if process.poll() is not None and not reader_thread.is_alive():
+                    break
+                continue
+
+            if line is None:
+                break
+            ingest_queue_line(line)
+    finally:
+        if timed_out:
+            with suppress(Exception):
+                process.wait(timeout=5)
+        reader_thread.join(timeout=5)
+        with suppress(Exception):
+            if process.stdout is not None:
+                process.stdout.close()
+
+    while True:
+        try:
+            line = line_queue.get_nowait()
+        except queue.Empty:
+            break
+        if line is None:
+            continue
+        ingest_queue_line(line)
+
+    json_output = "\n\n".join(agent_messages).strip()
+    return "".join(raw_lines), parsed_session_id, json_output, timed_out
+
+
+def run_codex(prompt, session_id=None, session_id_tracker=None):
     with tempfile.NamedTemporaryFile(prefix="codex-last-message-", suffix=".txt", delete=False) as tmp:
         output_file = tmp.name
 
@@ -729,36 +869,41 @@ def run_codex(prompt, session_id=None):
             codex_bin, args, timeout, workdir = build_codex_exec_args(prompt, output_file)
             log_codex_command(mode, workdir, [codex_bin, *args])
 
-        child = pexpect.spawn(
-            codex_bin,
-            args=args,
+        if session_id_tracker and session_id:
+            session_id_tracker.set(session_id)
+
+        process = subprocess.Popen(
+            [codex_bin, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
             encoding="utf-8",
-            timeout=timeout,
+            errors="replace",
+            bufsize=1,
             env=build_codex_child_env(),
             cwd=workdir,
         )
 
-        try:
-            child.expect(pexpect.EOF)
-            raw_output = child.before or ""
-        except pexpect.TIMEOUT:
-            child.close(force=True)
+        raw_output, parsed_session_id, json_output, timed_out = stream_codex_json_output(
+            process,
+            timeout,
+            session_id_tracker=session_id_tracker,
+        )
+        if timed_out:
             return CodexRunResult(
-                session_id=session_id,
+                session_id=(session_id_tracker.get() if session_id_tracker else None) or session_id,
                 text=f"Codex timed out after {timeout} seconds.",
                 exit_code=None,
-                raw_output="",
+                raw_output=raw_output,
                 final_output="",
-                json_output="",
-                cleaned_output="",
+                json_output=json_output,
+                cleaned_output=clean_codex_output(raw_output),
                 timed_out=True,
             )
-        finally:
-            if child.isalive():
-                child.close()
 
         final_output = read_output_file(output_file)
-        parsed_session_id, json_output = parse_codex_json_events(raw_output)
+        exit_code = process.wait()
         effective_session_id = parsed_session_id or session_id
         if session_id:
             if parsed_session_id and parsed_session_id != session_id:
@@ -770,8 +915,9 @@ def run_codex(prompt, session_id=None):
                     flush=True,
                 )
             effective_session_id = session_id
+        elif session_id_tracker:
+            effective_session_id = session_id_tracker.get() or effective_session_id
         cleaned_output = clean_codex_output(raw_output)
-        exit_code = child.exitstatus if child.exitstatus is not None else child.signalstatus
         log_codex_result(mode, exit_code, raw_output, final_output)
 
         if exit_code not in (0, None):
@@ -949,6 +1095,10 @@ def is_final_answer_phase(phase):
     return phase == "final_answer"
 
 
+def is_progress_phase(phase):
+    return bool(phase) and phase != "final_answer"
+
+
 def extract_conversation_events(thread_read_response):
     thread = read_field(thread_read_response, "thread", thread_read_response)
     events = []
@@ -977,6 +1127,33 @@ def extract_conversation_events(thread_read_response):
             text = (read_field(root, "text", "") or "").strip()
             if text:
                 events.append(ConversationEvent(turn_id=turn_id, item_id=item_id, role="assistant", text=text))
+
+    return events
+
+
+def extract_progress_events(thread_read_response):
+    thread = read_field(thread_read_response, "thread", thread_read_response)
+    events = []
+    fallback_index = 0
+
+    for turn in read_field(thread, "turns", []) or []:
+        turn_id = read_field(turn, "id") or f"turn-{fallback_index}"
+        for item in read_field(turn, "items", []) or []:
+            root = read_root(item)
+            item_type = read_field(root, "type")
+            item_id = read_field(root, "id") or f"{turn_id}:progress-{fallback_index}"
+            fallback_index += 1
+
+            if item_type != "agentMessage":
+                continue
+
+            phase = read_field(root, "phase")
+            if not is_progress_phase(phase):
+                continue
+
+            text = (read_field(root, "text", "") or "").strip()
+            if text:
+                events.append(ProgressEvent(turn_id=turn_id, item_id=item_id, phase=phase, text=text))
 
     return events
 
@@ -1055,6 +1232,119 @@ def build_watch_bootstrap(session_id):
     bootstrap_events = get_latest_completed_turn_events(events) or get_recent_turn_events(events)
     last_event_key = get_event_key(bootstrap_events[-1]) if bootstrap_events else None
     return format_conversation_events(bootstrap_events, heading="最近一轮对话:"), last_event_key
+
+
+def capture_progress_baseline(session_id):
+    try:
+        progress_events = extract_progress_events(read_thread_response(session_id))
+    except Exception:
+        return {}
+    return {event.item_id: event.text for event in progress_events}
+
+
+def format_progress_message(text):
+    quoted_text = "\n".join(
+        f"> {line}" if line else ">"
+        for line in (text or "").splitlines()
+    ).strip()
+    return f"*Codex Progress*\n{quoted_text}"
+
+
+def build_progress_messages(progress_events, previous_text_by_item_id):
+    messages = []
+
+    for event in progress_events:
+        previous_text = previous_text_by_item_id.get(event.item_id)
+        current_text = event.text
+        if previous_text == current_text:
+            continue
+
+        display_text = current_text
+        if previous_text and current_text.startswith(previous_text):
+            delta_text = current_text[len(previous_text) :].strip()
+            if not delta_text:
+                previous_text_by_item_id[event.item_id] = current_text
+                continue
+            display_text = delta_text
+        else:
+            display_text = truncate_text(current_text, max_length=1200)
+
+        previous_text_by_item_id[event.item_id] = current_text
+        messages.append(format_progress_message(display_text))
+
+    return messages
+
+
+def maybe_post_progress_updates(client, channel, thread_ts, session_id, previous_text_by_item_id):
+    try:
+        progress_events = extract_progress_events(read_thread_response(session_id))
+    except Exception:
+        return
+
+    for message in build_progress_messages(progress_events, previous_text_by_item_id):
+        post_chunks(client, channel, thread_ts, message)
+
+
+def run_codex_with_updates(client, channel, thread_ts, prompt, session_id=None, enable_progress=False):
+    result_box = {}
+    error_box = {}
+    session_id_tracker = SessionIdTracker(session_id=session_id)
+
+    def worker():
+        try:
+            result_box["result"] = run_codex(
+                prompt,
+                session_id=session_id,
+                session_id_tracker=session_id_tracker,
+            )
+        except Exception as exc:  # pragma: no cover
+            error_box["error"] = exc
+
+    worker_thread = threading.Thread(target=worker, daemon=True)
+    worker_thread.start()
+
+    start_monotonic = time.monotonic()
+    last_heartbeat_at = start_monotonic
+    last_progress_poll_at = start_monotonic
+    heartbeat_seconds = get_progress_heartbeat_seconds()
+    progress_poll_seconds = get_progress_poll_seconds()
+    progress_session_id = session_id if (enable_progress and session_id) else None
+    progress_baseline = capture_progress_baseline(progress_session_id) if progress_session_id else None
+
+    while worker_thread.is_alive():
+        worker_thread.join(timeout=1)
+        if not worker_thread.is_alive():
+            break
+
+        now = time.monotonic()
+        current_session_id = session_id_tracker.get()
+        if enable_progress and current_session_id and progress_session_id != current_session_id:
+            progress_session_id = current_session_id
+            # For brand-new sessions there is no earlier turn state to suppress,
+            # so start from an empty baseline and let the first poll emit current progress.
+            progress_baseline = (
+                capture_progress_baseline(current_session_id) if session_id else {}
+            )
+            last_progress_poll_at = 0
+
+        if enable_progress and progress_session_id and progress_baseline is not None:
+            if (now - last_progress_poll_at) >= progress_poll_seconds:
+                maybe_post_progress_updates(client, channel, thread_ts, progress_session_id, progress_baseline)
+                last_progress_poll_at = now
+
+        if (now - last_heartbeat_at) >= heartbeat_seconds:
+            session_hint = f" session `{current_session_id}`" if current_session_id else ""
+            post_chunks(
+                client,
+                channel,
+                thread_ts,
+                f"仍在运行，已持续 {format_elapsed_seconds(now - start_monotonic)}。{session_hint}".strip(),
+            )
+            last_heartbeat_at = now
+
+    if error_box:
+        raise error_box["error"]
+    return result_box["result"]
 
 
 def post_chunks(client, channel, thread_ts, text):
@@ -1201,7 +1491,14 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     )
                     workdir = ENV.get("CODEX_WORKDIR", str(Path.cwd()))
                     with session_execution_guard(current_session_id):
-                        codex_result = run_codex(build_handoff_prompt(), session_id=current_session_id)
+                        codex_result = run_codex_with_updates(
+                            client,
+                            channel,
+                            thread_ts,
+                            build_handoff_prompt(),
+                            session_id=current_session_id,
+                            enable_progress=False,
+                        )
                     next_session_id = codex_result.session_id
                     result = append_handoff_footer(codex_result.text, next_session_id or current_session_id, workdir)
                     print(
@@ -1246,7 +1543,14 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         text=f"<@{user_id}> 正在整理当前 session 的 recap，请稍等。",
                     )
                     with session_execution_guard(current_session_id):
-                        codex_result = run_codex(build_recap_prompt(), session_id=current_session_id)
+                        codex_result = run_codex_with_updates(
+                            client,
+                            channel,
+                            thread_ts,
+                            build_recap_prompt(),
+                            session_id=current_session_id,
+                            enable_progress=False,
+                        )
                     next_session_id = codex_result.session_id
                     result = append_recap_footer(codex_result.text, next_session_id or current_session_id)
                     print(
@@ -1506,7 +1810,14 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                 )
 
                 with session_execution_guard(existing_session_id):
-                    codex_result = run_codex(effective_prompt, session_id=existing_session_id)
+                    codex_result = run_codex_with_updates(
+                        client,
+                        channel,
+                        thread_ts,
+                        effective_prompt,
+                        session_id=existing_session_id,
+                        enable_progress=True,
+                    )
                     next_session_id = codex_result.session_id
                     result = codex_result.text
                     print(
@@ -1527,7 +1838,13 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             thread_ts=thread_ts,
                             text=f"<@{user_id}> 当前 Slack thread 的 Codex 会话不可恢复，正在自动重建新会话。",
                         )
-                        codex_result = run_codex(effective_prompt)
+                        codex_result = run_codex_with_updates(
+                            client,
+                            channel,
+                            thread_ts,
+                            effective_prompt,
+                            enable_progress=True,
+                        )
                         next_session_id = codex_result.session_id
                         result = codex_result.text
                         print(

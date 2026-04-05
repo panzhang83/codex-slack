@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -334,6 +335,119 @@ class CodexHelperTests(unittest.TestCase):
         with patch.dict(server.ENV, {"CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES": "invalid"}, clear=False):
             value = server.get_app_server_stdio_line_limit_bytes()
         self.assertEqual(value, server.DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES)
+
+    def test_get_codex_settings_allows_zero_timeout(self):
+        with patch.dict(server.ENV, {"CODEX_TIMEOUT_SECONDS": "0"}, clear=False):
+            _codex_bin, _model, _workdir, timeout, _sandbox, _extra_args, _full_auto = server.get_codex_settings()
+        self.assertEqual(timeout, 0)
+
+    def test_format_elapsed_seconds_formats_hours_minutes_and_seconds(self):
+        self.assertEqual(server.format_elapsed_seconds(5), "5s")
+        self.assertEqual(server.format_elapsed_seconds(65), "1m 5s")
+        self.assertEqual(server.format_elapsed_seconds(3665), "1h 1m 5s")
+
+    def test_parse_codex_json_events_extracts_thread_id_and_agent_messages(self):
+        payload = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"019d5868-71ba-7101-9143-81867f3db5bf"}',
+                '{"type":"turn.started"}',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"first"}}',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"second"}}',
+            ]
+        )
+
+        session_id, message_text = server.parse_codex_json_events(payload)
+
+        self.assertEqual(session_id, "019d5868-71ba-7101-9143-81867f3db5bf")
+        self.assertEqual(message_text, "first\n\nsecond")
+
+    def test_process_codex_json_event_updates_session_tracker_on_thread_started(self):
+        tracker = server.SessionIdTracker()
+        parsed_session_id = server.process_codex_json_event(
+            {"type": "thread.started", "thread_id": "019d5868-71ba-7101-9143-81867f3db5bf"},
+            None,
+            [],
+            session_id_tracker=tracker,
+        )
+
+        self.assertEqual(parsed_session_id, "019d5868-71ba-7101-9143-81867f3db5bf")
+        self.assertEqual(tracker.get(), "019d5868-71ba-7101-9143-81867f3db5bf")
+
+
+class ProgressExtractionTests(unittest.TestCase):
+    def test_extract_progress_events_keeps_non_final_agent_messages(self):
+        response = make_thread_response(
+            make_turn(
+                "turn-1",
+                agent_message("a1", "commentary", "working"),
+                agent_message("a2", "final_answer", "done"),
+            )
+        )
+
+        events = server.extract_progress_events(response)
+
+        self.assertEqual(
+            events,
+            [
+                server.ProgressEvent(turn_id="turn-1", item_id="a1", phase="commentary", text="working"),
+            ],
+        )
+
+    def test_build_progress_messages_emits_only_new_suffix_when_text_grows(self):
+        previous = {"a1": "hello"}
+        events = [server.ProgressEvent(turn_id="turn-1", item_id="a1", phase="commentary", text="hello world")]
+
+        messages = server.build_progress_messages(events, previous)
+
+        self.assertEqual(messages, ["*Codex Progress*\n> world"])
+        self.assertEqual(previous["a1"], "hello world")
+
+    def test_build_progress_messages_skips_unchanged_text(self):
+        previous = {"a1": "hello"}
+        events = [server.ProgressEvent(turn_id="turn-1", item_id="a1", phase="commentary", text="hello")]
+
+        messages = server.build_progress_messages(events, previous)
+
+        self.assertEqual(messages, [])
+
+    def test_run_codex_with_updates_picks_up_new_session_id_for_progress_polling(self):
+        discovered_session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
+        progress_calls = []
+
+        def fake_run_codex(prompt, session_id=None, session_id_tracker=None):
+            self.assertIsNone(session_id)
+            self.assertIsNotNone(session_id_tracker)
+            session_id_tracker.set(discovered_session_id)
+            time.sleep(1.2)
+            return server.CodexRunResult(
+                session_id=discovered_session_id,
+                text="done",
+                exit_code=0,
+                raw_output="",
+                final_output="done",
+                json_output="done",
+                cleaned_output="done",
+                timed_out=False,
+            )
+
+        def fake_progress(client, channel, thread_ts, session_id, previous_text_by_item_id):
+            progress_calls.append((session_id, dict(previous_text_by_item_id)))
+
+        with patch.object(server, "run_codex", side_effect=fake_run_codex):
+            with patch.object(server, "maybe_post_progress_updates", side_effect=fake_progress):
+                with patch.object(server, "get_progress_poll_seconds", return_value=1):
+                    with patch.object(server, "get_progress_heartbeat_seconds", return_value=999):
+                        result = server.run_codex_with_updates(
+                            DummyClient(),
+                            "C1",
+                            "1",
+                            "start a new session",
+                            session_id=None,
+                            enable_progress=True,
+                        )
+
+        self.assertEqual(result.session_id, discovered_session_id)
+        self.assertEqual(progress_calls, [(discovered_session_id, {})])
 
 
 class ProcessPromptTests(unittest.TestCase):
