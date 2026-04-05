@@ -1,17 +1,33 @@
 import atexit
+import asyncio
+import json
 import os
 import re
 import shlex
 import tempfile
 import threading
-import json
 import time
-from contextlib import contextmanager
+import warnings
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+warnings.filterwarnings(
+    "ignore",
+    message=r'Field ".*" .* protected namespace "model_".*',
+    category=UserWarning,
+)
+
 import pexpect
+try:
+    from codex_app_server_sdk import CodexClient
+    from codex_app_server_sdk.transport import CodexTransportError, StdioTransport
+except ImportError as exc:  # pragma: no cover
+    raise RuntimeError(
+        "Missing dependency `codex-app-server-sdk`. "
+        "Run `pip install -r requirements.txt` before starting codex-slack."
+    ) from exc
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -38,7 +54,9 @@ ENV = load_env()
 SESSION_STORE_PATH = Path(
     ENV.get("CODEX_SLACK_SESSION_STORE", Path(__file__).with_name(".codex-slack-sessions.json"))
 ).expanduser()
-INSTANCE_LOCK_PATH = Path(ENV.get("CODEX_SLACK_INSTANCE_LOCK", Path(__file__).with_name(".codex-slack.pid"))).expanduser()
+INSTANCE_LOCK_PATH = Path(
+    ENV.get("CODEX_SLACK_INSTANCE_LOCK", Path(__file__).with_name(".codex-slack.pid"))
+).expanduser()
 SESSION_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -46,7 +64,15 @@ THREAD_LOCKS = {}
 THREAD_LOCKS_GUARD = threading.Lock()
 SESSION_LOCKS = {}
 SESSION_LOCKS_GUARD = threading.Lock()
+WATCHERS = {}
+WATCHERS_GUARD = threading.Lock()
 INSTANCE_LOCK_HANDLE = None
+SESSION_MODE_OBSERVE = "observe"
+SESSION_MODE_CONTROL = "control"
+DEFAULT_WATCH_POLL_SECONDS = 5
+MAX_APP_SERVER_RETRIES = 2
+MAX_WATCH_READ_FAILURES = 2
+DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES = 32 * 1024 * 1024
 
 
 class SlackThreadSessionStore:
@@ -69,15 +95,21 @@ class SlackThreadSessionStore:
         for key, value in data.items():
             if isinstance(value, str):
                 normalized[key] = {"session_id": value, "updated_at": 0}
-            elif isinstance(value, dict) and isinstance(value.get("session_id"), str):
-                entry = {
-                    "session_id": value["session_id"],
-                    "updated_at": value.get("updated_at", 0),
-                }
-                owner_user_id = value.get("owner_user_id")
-                if isinstance(owner_user_id, str) and owner_user_id:
-                    entry["owner_user_id"] = owner_user_id
-                normalized[key] = entry
+                continue
+            if not isinstance(value, dict) or not isinstance(value.get("session_id"), str):
+                continue
+
+            entry = {
+                "session_id": value["session_id"],
+                "updated_at": value.get("updated_at", 0),
+            }
+            mode = value.get("mode")
+            if mode in {SESSION_MODE_OBSERVE, SESSION_MODE_CONTROL}:
+                entry["mode"] = mode
+            owner_user_id = value.get("owner_user_id")
+            if isinstance(owner_user_id, str) and owner_user_id:
+                entry["owner_user_id"] = owner_user_id
+            normalized[key] = entry
         return normalized
 
     def _save_locked(self):
@@ -102,6 +134,13 @@ class SlackThreadSessionStore:
                 return None
             return entry.get("session_id")
 
+    def get_mode(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return entry.get("mode") or SESSION_MODE_CONTROL
+
     def get_owner(self, key):
         with self._lock:
             entry = self._sessions.get(key)
@@ -121,18 +160,19 @@ class SlackThreadSessionStore:
 
     def set(self, key, session_id, owner_user_id=None):
         with self._lock:
-            existing_owner_user_id = self._sessions.get(key, {}).get("owner_user_id")
+            existing_entry = self._sessions.get(key, {})
             entry = {
                 "session_id": session_id,
                 "updated_at": int(time.time()),
+                "mode": existing_entry.get("mode") or SESSION_MODE_CONTROL,
             }
-            effective_owner_user_id = owner_user_id or existing_owner_user_id
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
             if effective_owner_user_id:
                 entry["owner_user_id"] = effective_owner_user_id
             self._sessions[key] = entry
             self._save_locked()
 
-    def attach_session(self, key, session_id, owner_user_id, allow_unseen=False):
+    def attach_session(self, key, session_id, owner_user_id, allow_unseen=False, mode=SESSION_MODE_OBSERVE):
         with self._lock:
             previous_session_id = self._sessions.get(key, {}).get("session_id")
             existing_thread_owner_user_id = self._sessions.get(key, {}).get("owner_user_id")
@@ -160,9 +200,21 @@ class SlackThreadSessionStore:
                 "session_id": session_id,
                 "updated_at": int(time.time()),
                 "owner_user_id": owner_user_id,
+                "mode": mode if mode in {SESSION_MODE_OBSERVE, SESSION_MODE_CONTROL} else SESSION_MODE_OBSERVE,
             }
             self._save_locked()
             return previous_session_id, None
+
+    def set_mode(self, key, mode):
+        if mode not in {SESSION_MODE_OBSERVE, SESSION_MODE_CONTROL}:
+            return
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return
+            entry["mode"] = mode
+            entry["updated_at"] = int(time.time())
+            self._save_locked()
 
     def delete(self, key):
         with self._lock:
@@ -188,6 +240,61 @@ class ThreadLockState:
     waiters: int = 0
 
 
+@dataclass
+class WatchHandle:
+    thread: threading.Thread
+    stop_event: threading.Event
+    session_id: str
+    channel: str
+    thread_ts: str
+
+
+@dataclass(frozen=True)
+class ConversationEvent:
+    turn_id: str
+    item_id: str
+    role: str
+    text: str
+
+
+class WatchAnchorLostError(RuntimeError):
+    pass
+
+
+class LargePayloadStdioTransport(StdioTransport):
+    """SDK stdio transport with a larger stdout line limit for huge thread/read payloads."""
+
+    def __init__(self, command, *, cwd=None, env=None, connect_timeout=30.0, line_limit_bytes=None):
+        super().__init__(
+            command,
+            cwd=cwd,
+            env=env,
+            connect_timeout=connect_timeout,
+        )
+        self._line_limit_bytes = int(line_limit_bytes or DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES)
+
+    async def connect(self) -> None:
+        if self._proc is not None:
+            return
+        try:
+            self._proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *self._command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    cwd=self._cwd,
+                    env=self._env,
+                    limit=self._line_limit_bytes,
+                ),
+                timeout=self._connect_timeout,
+            )
+        except Exception as exc:  # pragma: no cover
+            raise CodexTransportError(
+                f"failed to start stdio transport command: {self._command!r}"
+            ) from exc
+
+
 def chunk_text(text, max_length=3500):
     normalized = (text or "").strip()
     if not normalized:
@@ -199,6 +306,27 @@ def chunk_text(text, max_length=3500):
         chunks.append(normalized[start : start + max_length])
         start += max_length
     return chunks
+
+
+def read_field(obj, name, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def read_root(obj):
+    if isinstance(obj, dict):
+        return obj.get("root", obj)
+    return getattr(obj, "root", obj)
+
+
+def truncate_text(text, max_length=280):
+    normalized = (text or "").strip()
+    if len(normalized) <= max_length:
+        return normalized
+    if max_length <= 15:
+        return normalized[:max_length]
+    return normalized[: max_length - 14].rstrip() + "...<truncated>"
 
 
 def strip_app_mentions(text):
@@ -243,12 +371,36 @@ def is_recap_command(text):
     return normalized in {"/recap", "recap"}
 
 
+def is_watch_command(text):
+    return strip_command_payload(text, "watch") == ""
+
+
+def is_unsupported_watch_command(text):
+    payload = strip_command_payload(text, "watch")
+    return payload not in (None, "")
+
+
+def is_unwatch_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/unwatch", "unwatch", "stop watch", "/stop-watch"}
+
+
 def is_attach_command(text):
     return strip_command_payload(text, "attach") is not None
 
 
 def strip_attach_command(text):
     return strip_command_payload(text, "attach") or ""
+
+
+def is_control_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/control", "control", "/takeover", "takeover"}
+
+
+def is_observe_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/observe", "observe", "/release", "release"}
 
 
 def strip_fresh_command(text):
@@ -268,6 +420,29 @@ def get_codex_settings():
     extra_args = ENV.get("CODEX_EXTRA_ARGS", "").strip()
     full_auto = ENV.get("CODEX_FULL_AUTO", "0") == "1"
     return codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto
+
+
+def get_app_server_stdio_line_limit_bytes():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES",
+            DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES,
+        )
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES
+    return max(1024 * 1024, value)
+
+
+def get_watch_poll_seconds():
+    raw = str(ENV.get("CODEX_SLACK_WATCH_POLL_SECONDS", DEFAULT_WATCH_POLL_SECONDS)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_WATCH_POLL_SECONDS
+    return max(1, value)
 
 
 def get_allowed_slack_user_ids():
@@ -319,8 +494,6 @@ def get_thread_owner_access_error(thread_key, user_id, session_store=None):
 def get_attach_error(user_id, session_id, session_store=None):
     session_store = session_store or SESSION_STORE
     normalized_session_id = (session_id or "").strip()
-    # This is a UX preflight check only. attach_session() remains the atomic
-    # authority that enforces cross-user ownership inside the store lock.
 
     if not normalized_session_id:
         return "请用 `attach <session_id>` 绑定一个已有的 Codex 会话。"
@@ -341,7 +514,20 @@ def get_attach_error(user_id, session_id, session_store=None):
     return get_shared_attach_error()
 
 
-def build_codex_exec_args(prompt, output_file):
+def get_session_mode(thread_key, session_store=None):
+    session_store = session_store or SESSION_STORE
+    return session_store.get_mode(thread_key) or SESSION_MODE_CONTROL
+
+
+def get_observe_mode_error(user_id, session_id):
+    return (
+        f"<@{user_id}> 当前 Slack thread 绑定的 session `{session_id or '-'}` 处于 `observe` 模式。"
+        " 为避免和终端里的交互式 Codex 会话并发写入，普通消息暂不会继续 `resume`。"
+        " 如果你确认要由 Slack 接管，请先发送 `control` 或 `takeover`。"
+    )
+
+
+def build_codex_exec_args(prompt, output_file, extra_cli_args=None):
     codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto = get_codex_settings()
     args = [
         "exec",
@@ -364,14 +550,15 @@ def build_codex_exec_args(prompt, output_file):
     if extra_args:
         args.extend(shlex.split(extra_args))
 
+    if extra_cli_args:
+        args.extend(extra_cli_args)
+
     args.append(prompt)
     return codex_bin, args, timeout, workdir
 
 
-def build_codex_resume_args(session_id, prompt, output_file):
+def build_codex_resume_args(session_id, prompt, output_file, extra_cli_args=None):
     codex_bin, model, workdir, timeout, _sandbox, _extra_args, full_auto = get_codex_settings()
-    # `codex exec resume` currently exposes a smaller flag surface than `codex exec`.
-    # Keep this list limited to options accepted by the live CLI help output.
     args = [
         "exec",
         "resume",
@@ -384,6 +571,8 @@ def build_codex_resume_args(session_id, prompt, output_file):
     ]
     if full_auto:
         args.append("--full-auto")
+    if extra_cli_args:
+        args.extend(extra_cli_args)
     args.extend([session_id, prompt])
     return codex_bin, args, timeout, workdir
 
@@ -401,29 +590,9 @@ def clean_codex_output(text):
 
         if stripped.startswith("WARNING: proceeding, even though we could not update PATH:"):
             continue
-        if lower.startswith("thinking"):
+        if lower.startswith(("thinking", "working", "running", "checking", "searching", "reading")):
             continue
-        if lower.startswith("working"):
-            continue
-        if lower.startswith("running"):
-            continue
-        if lower.startswith("checking"):
-            continue
-        if lower.startswith("searching"):
-            continue
-        if lower.startswith("reading"):
-            continue
-        if lower.startswith("tool call"):
-            continue
-        if lower.startswith("exec_command"):
-            continue
-        if lower.startswith("apply_patch"):
-            continue
-        if lower.startswith("function call"):
-            continue
-        if lower.startswith("response_item"):
-            continue
-        if lower.startswith("commentary"):
+        if lower.startswith(("tool call", "exec_command", "apply_patch", "function call", "response_item", "commentary")):
             continue
         filtered.append(line)
 
@@ -560,13 +729,12 @@ def run_codex(prompt, session_id=None):
             codex_bin, args, timeout, workdir = build_codex_exec_args(prompt, output_file)
             log_codex_command(mode, workdir, [codex_bin, *args])
 
-        child_env = build_codex_child_env()
         child = pexpect.spawn(
             codex_bin,
             args=args,
             encoding="utf-8",
             timeout=timeout,
-            env=child_env,
+            env=build_codex_child_env(),
             cwd=workdir,
         )
 
@@ -605,6 +773,7 @@ def run_codex(prompt, session_id=None):
         cleaned_output = clean_codex_output(raw_output)
         exit_code = child.exitstatus if child.exitstatus is not None else child.signalstatus
         log_codex_result(mode, exit_code, raw_output, final_output)
+
         if exit_code not in (0, None):
             if final_output:
                 result_text = final_output
@@ -719,6 +888,175 @@ def session_execution_guard(session_id):
         release_session_lock(session_id)
 
 
+def create_app_server_client():
+    codex_bin, _model, workdir, _timeout, _sandbox, _extra_args, _full_auto = get_codex_settings()
+    transport = LargePayloadStdioTransport(
+        [codex_bin, "app-server"],
+        cwd=workdir,
+        env=build_codex_child_env(),
+        line_limit_bytes=get_app_server_stdio_line_limit_bytes(),
+    )
+    return CodexClient(transport)
+
+
+async def read_thread_response_async(session_id):
+    client = create_app_server_client()
+    await client.start()
+    await client.initialize()
+    try:
+        return await client.read_thread(session_id, include_turns=True)
+    finally:
+        with suppress(Exception):
+            await client.close()
+
+
+def read_thread_response(session_id):
+    last_error = None
+    for _attempt in range(MAX_APP_SERVER_RETRIES):
+        try:
+            return asyncio.run(read_thread_response_async(session_id))
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"读取 thread 对话失败: {last_error}")
+
+
+def format_user_input(user_input):
+    root = read_root(user_input)
+    input_type = read_field(root, "type")
+    if input_type == "text":
+        return (read_field(root, "text", "") or "").strip()
+    if input_type == "image":
+        return "[image]"
+    if input_type == "localImage":
+        return f"[local image: {read_field(root, 'path', '-') or '-'}]"
+    if input_type == "skill":
+        return f"[skill: {read_field(root, 'name', '-') or '-'}]"
+    if input_type == "mention":
+        return f"[mention: {read_field(root, 'name', '-') or '-'}]"
+    return ""
+
+
+def format_user_message_content(content_items):
+    parts = []
+    for item in content_items or []:
+        part = format_user_input(item)
+        if part:
+            parts.append(part)
+    return "\n".join(parts).strip()
+
+
+def is_final_answer_phase(phase):
+    return phase == "final_answer"
+
+
+def extract_conversation_events(thread_read_response):
+    thread = read_field(thread_read_response, "thread", thread_read_response)
+    events = []
+    fallback_index = 0
+
+    for turn in read_field(thread, "turns", []) or []:
+        turn_id = read_field(turn, "id") or f"turn-{fallback_index}"
+        for item in read_field(turn, "items", []) or []:
+            root = read_root(item)
+            item_type = read_field(root, "type")
+            item_id = read_field(root, "id") or f"{turn_id}:item-{fallback_index}"
+            fallback_index += 1
+
+            if item_type == "userMessage":
+                text = format_user_message_content(read_field(root, "content", []) or [])
+                if text:
+                    events.append(ConversationEvent(turn_id=turn_id, item_id=item_id, role="user", text=text))
+                continue
+
+            if item_type != "agentMessage":
+                continue
+
+            if not is_final_answer_phase(read_field(root, "phase")):
+                continue
+
+            text = (read_field(root, "text", "") or "").strip()
+            if text:
+                events.append(ConversationEvent(turn_id=turn_id, item_id=item_id, role="assistant", text=text))
+
+    return events
+
+
+def read_conversation_events(session_id):
+    return extract_conversation_events(read_thread_response(session_id))
+
+
+def get_event_key(event):
+    return (event.turn_id, event.item_id)
+
+
+def get_recent_turn_events(events):
+    if not events:
+        return []
+    last_turn_id = events[-1].turn_id
+    return [event for event in events if event.turn_id == last_turn_id]
+
+
+def get_latest_completed_turn_events(events):
+    if not events:
+        return []
+
+    grouped_turns = []
+    current_turn_id = None
+    current_events = []
+    for event in events:
+        if event.turn_id != current_turn_id:
+            if current_events:
+                grouped_turns.append(current_events)
+            current_turn_id = event.turn_id
+            current_events = [event]
+        else:
+            current_events.append(event)
+    if current_events:
+        grouped_turns.append(current_events)
+
+    for turn_events in reversed(grouped_turns):
+        if any(event.role == "assistant" for event in turn_events):
+            return turn_events
+    return []
+
+
+def get_events_after_key(events, last_key):
+    if last_key is None:
+        return list(events)
+
+    for index, event in enumerate(events):
+        if get_event_key(event) == last_key:
+            return events[index + 1 :]
+
+    raise WatchAnchorLostError(f"watch anchor {last_key!r} is no longer present in the current thread view")
+
+
+def format_conversation_events(events, heading=None):
+    if not events:
+        return "当前 thread 还没有可显示的对话内容。"
+
+    blocks = []
+    if heading:
+        blocks.append(heading)
+
+    for event in events:
+        label = "User" if event.role == "user" else "Codex"
+        quoted_text = "\n".join(
+            f"> {line}" if line else ">"
+            for line in (event.text or "").splitlines()
+        ).strip()
+        blocks.append(f"*{label}*\n{quoted_text}")
+
+    return "\n\n".join(blocks).strip()
+
+
+def build_watch_bootstrap(session_id):
+    events = read_conversation_events(session_id)
+    bootstrap_events = get_latest_completed_turn_events(events) or get_recent_turn_events(events)
+    last_event_key = get_event_key(bootstrap_events[-1]) if bootstrap_events else None
+    return format_conversation_events(bootstrap_events, heading="最近一轮对话:"), last_event_key
+
+
 def post_chunks(client, channel, thread_ts, text):
     for chunk in chunk_text(text):
         print(
@@ -729,6 +1067,93 @@ def post_chunks(client, channel, thread_ts, text):
             flush=True,
         )
         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk)
+
+
+def get_watcher(thread_key):
+    with WATCHERS_GUARD:
+        return WATCHERS.get(thread_key)
+
+
+def clear_watcher(thread_key, watcher):
+    with WATCHERS_GUARD:
+        if WATCHERS.get(thread_key) is watcher:
+            WATCHERS.pop(thread_key, None)
+
+
+def stop_watcher(thread_key):
+    with WATCHERS_GUARD:
+        watcher = WATCHERS.pop(thread_key, None)
+    if watcher is None:
+        return False
+    watcher.stop_event.set()
+    return True
+
+
+def watch_loop(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key=None):
+    failure_count = 0
+    current_last_event_key = last_event_key
+    poll_seconds = get_watch_poll_seconds()
+
+    try:
+        while not stop_event.wait(poll_seconds):
+            if SESSION_STORE.get(thread_key) != session_id:
+                break
+
+            try:
+                events = read_conversation_events(session_id)
+                failure_count = 0
+            except Exception as exc:
+                failure_count += 1
+                if failure_count >= MAX_WATCH_READ_FAILURES:
+                    post_chunks(
+                        client,
+                        channel,
+                        thread_ts,
+                        f"持续 watch 已停止：读取当前 thread 对话失败。\n\n{exc}",
+                    )
+                    break
+                continue
+
+            try:
+                new_events = get_events_after_key(events, current_last_event_key)
+            except WatchAnchorLostError:
+                post_chunks(
+                    client,
+                    channel,
+                    thread_ts,
+                    "持续 watch 已停止：当前 thread 对话锚点已经失效。请重新发送 `watch` 重新建立镜像。",
+                )
+                break
+            if not new_events:
+                continue
+
+            current_last_event_key = get_event_key(new_events[-1])
+            post_chunks(client, channel, thread_ts, format_conversation_events(new_events))
+    finally:
+        watcher = get_watcher(thread_key)
+        if watcher and watcher.stop_event is stop_event:
+            clear_watcher(thread_key, watcher)
+
+
+def start_watcher(client, channel, thread_ts, thread_key, session_id, last_event_key=None):
+    stop_watcher(thread_key)
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=watch_loop,
+        args=(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key),
+        daemon=True,
+    )
+    watcher = WatchHandle(
+        thread=thread,
+        stop_event=stop_event,
+        session_id=session_id,
+        channel=channel,
+        thread_ts=thread_ts,
+    )
+    with WATCHERS_GUARD:
+        WATCHERS[thread_key] = watcher
+        thread.start()
+    return watcher
 
 
 def process_prompt(client, channel, thread_ts, prompt, user_id):
@@ -747,20 +1172,25 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
             with lock:
                 owner_error = get_thread_owner_access_error(thread_key, user_id)
                 if owner_error:
-                    client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        text=owner_error,
-                    )
+                    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=owner_error)
                     return
 
+                current_session_id = SESSION_STORE.get(thread_key)
+                current_session_mode = get_session_mode(thread_key)
+
                 if is_handoff_command(prompt):
-                    current_session_id = SESSION_STORE.get(thread_key)
                     if not current_session_id:
                         client.chat_postMessage(
                             channel=channel,
                             thread_ts=thread_ts,
                             text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法生成 handoff note。",
+                        )
+                        return
+                    if current_session_mode != SESSION_MODE_CONTROL:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=get_observe_mode_error(user_id, current_session_id),
                         )
                         return
 
@@ -771,10 +1201,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     )
                     workdir = ENV.get("CODEX_WORKDIR", str(Path.cwd()))
                     with session_execution_guard(current_session_id):
-                        codex_result = run_codex(
-                            build_handoff_prompt(),
-                            session_id=current_session_id,
-                        )
+                        codex_result = run_codex(build_handoff_prompt(), session_id=current_session_id)
                     next_session_id = codex_result.session_id
                     result = append_handoff_footer(codex_result.text, next_session_id or current_session_id, workdir)
                     print(
@@ -798,12 +1225,18 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     return
 
                 if is_recap_command(prompt):
-                    current_session_id = SESSION_STORE.get(thread_key)
                     if not current_session_id:
                         client.chat_postMessage(
                             channel=channel,
                             thread_ts=thread_ts,
                             text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法生成 recap。",
+                        )
+                        return
+                    if current_session_mode != SESSION_MODE_CONTROL:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=get_observe_mode_error(user_id, current_session_id),
                         )
                         return
 
@@ -813,10 +1246,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         text=f"<@{user_id}> 正在整理当前 session 的 recap，请稍等。",
                     )
                     with session_execution_guard(current_session_id):
-                        codex_result = run_codex(
-                            build_recap_prompt(),
-                            session_id=current_session_id,
-                        )
+                        codex_result = run_codex(build_recap_prompt(), session_id=current_session_id)
                     next_session_id = codex_result.session_id
                     result = append_recap_footer(codex_result.text, next_session_id or current_session_id)
                     print(
@@ -839,9 +1269,108 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     post_chunks(client, channel, thread_ts, result)
                     return
 
+                if is_unsupported_watch_command(prompt):
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text="`watch` 现在只支持 thread 对话视图，不再接受参数。请直接发送 `watch`。",
+                    )
+                    return
+
+                if is_watch_command(prompt):
+                    if not current_session_id:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法查看 thread 对话。",
+                        )
+                        return
+
+                    try:
+                        watch_text, last_event_key = build_watch_bootstrap(current_session_id)
+                    except Exception as exc:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 读取当前 thread 对话失败。\n\n{exc}",
+                        )
+                        return
+
+                    start_watcher(client, channel, thread_ts, thread_key, current_session_id, last_event_key=last_event_key)
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f"{watch_text}\n\n"
+                            "已开始持续 watch。后续我只会把新的 thread 对话推送到这个 Slack thread。"
+                            " 如果你想停止持续推送，可以发送 `stop watch` 或 `unwatch`。"
+                        ),
+                    )
+                    return
+
+                if is_unwatch_command(prompt):
+                    if stop_watcher(thread_key):
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 已停止当前 Slack thread 的持续 watch。",
+                        )
+                    else:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 当前 Slack thread 没有正在运行的持续 watch。",
+                        )
+                    return
+
+                if is_control_command(prompt):
+                    if not current_session_id:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法切到 control 模式。",
+                        )
+                        return
+                    SESSION_STORE.set_mode(thread_key, SESSION_MODE_CONTROL)
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f"<@{user_id}> 当前 Slack thread 已切到 `control` 模式，后续普通消息会继续 session `{current_session_id}`。\n\n"
+                            "如果终端里的交互式 Codex 还在活跃，请不要并发操作同一个 session。"
+                        ),
+                    )
+                    return
+
+                if is_observe_command(prompt):
+                    if not current_session_id:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法切到 observe 模式。",
+                        )
+                        return
+                    SESSION_STORE.set_mode(thread_key, SESSION_MODE_OBSERVE)
+                    watch_hint = ""
+                    if get_watcher(thread_key):
+                        watch_hint = (
+                            "\n\n当前这个 Slack thread 的 `watch` 仍在运行，所以新的对话更新还会继续推送。"
+                            " 如果你也想停止推送，再发送 `unwatch` 或 `stop watch`。"
+                        )
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f"<@{user_id}> 当前 Slack thread 已切到 `observe` 模式。\n\n"
+                            "后续你可以继续用 `watch` / `where` / `session` 查看状态，但普通消息不会继续 `resume` 这个 session。"
+                            f"{watch_hint}"
+                        ),
+                    )
+                    return
+
                 if is_status_command(prompt):
-                    current_session_id = SESSION_STORE.get(thread_key)
-                    codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto = get_codex_settings()
+                    codex_bin, model, workdir, timeout, sandbox, _extra_args, _full_auto = get_codex_settings()
+                    watch_active = "yes" if get_watcher(thread_key) else "no"
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
@@ -849,21 +1378,19 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             f"<@{user_id}> 当前 Slack thread 的运行状态:\n\n"
                             f"- thread_key: `{thread_key}`\n"
                             f"- session_id: `{current_session_id or '-'}`\n"
+                            f"- session_mode: `{current_session_mode if current_session_id else '-'}`\n"
                             f"- model: `{model}`\n"
                             f"- workdir: `{workdir}`\n"
                             f"- sandbox: `{sandbox or '-'}`\n"
                             f"- timeout_seconds: `{timeout}`\n"
                             f"- codex_bin: `{codex_bin}`\n"
-                            f"- full_auto: `{1 if full_auto else 0}`\n"
-                            f"- extra_args: `{extra_args or '-'}`\n"
-                            f"- session_store: `{SESSION_STORE_PATH}`\n\n"
+                            f"- watch_active: `{watch_active}`\n"
                             "如果你想让终端继续同一个会话，可以在终端里使用这个 `session_id` 执行 `codex exec resume ...`。"
                         ),
                     )
                     return
 
                 if is_session_command(prompt):
-                    current_session_id = SESSION_STORE.get(thread_key)
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
@@ -892,13 +1419,10 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             normalized_session_id,
                             owner_user_id=user_id,
                             allow_unseen=is_unseen_attach_allowed(user_id),
+                            mode=SESSION_MODE_OBSERVE,
                         )
                     if attach_error:
-                        client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=attach_error,
-                        )
+                        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=attach_error)
                         return
 
                     log_session_event(
@@ -907,19 +1431,21 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         existing_session_id=previous_session_id,
                         next_session_id=normalized_session_id,
                     )
+                    stop_watcher(thread_key)
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
                         text=(
                             f"<@{user_id}> 当前 Slack thread 已绑定到 Codex session `{normalized_session_id}`。\n\n"
-                            "后续你在这个 thread 里发送的普通消息会继续这个会话。"
-                            " 为避免上下文冲突，请不要同时在终端和 Slack 两边并发操作同一个 session。"
+                            "默认已进入 `observe` 模式。你可以先用 `watch`、`where`、`session` 查看 thread 对话。"
+                            " 如果你确认要由 Slack 接管，再发送 `control` 或 `takeover`。"
                         ),
                     )
                     return
 
                 if is_reset_command(prompt):
                     previous_session_id = SESSION_STORE.get(thread_key)
+                    stop_watcher(thread_key)
                     SESSION_STORE.delete(thread_key)
                     log_session_event("reset", thread_key, existing_session_id=previous_session_id)
                     client.chat_postMessage(
@@ -939,7 +1465,15 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     )
                     return
 
-                existing_session_id = None if force_fresh else SESSION_STORE.get(thread_key)
+                existing_session_id = None if force_fresh else current_session_id
+                if existing_session_id and current_session_mode != SESSION_MODE_CONTROL:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=get_observe_mode_error(user_id, existing_session_id),
+                    )
+                    return
+
                 log_session_event(
                     "fresh_attempt" if force_fresh else ("resume_attempt" if existing_session_id else "new_attempt"),
                     thread_key,
@@ -999,7 +1533,6 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     existing_session_id=existing_session_id,
                     next_session_id=next_session_id,
                 )
-
                 post_chunks(client, channel, thread_ts, result)
         finally:
             release_thread_lock(thread_key)

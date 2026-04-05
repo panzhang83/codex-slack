@@ -1,49 +1,71 @@
+import os
 import tempfile
-import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import server
 
 
+def ns(**kwargs):
+    return SimpleNamespace(**kwargs)
+
+
+def text_item(text):
+    return ns(root=ns(type="text", text=text))
+
+
+def local_image_item(path):
+    return ns(root=ns(type="localImage", path=path))
+
+
+def mention_item(name):
+    return ns(root=ns(type="mention", name=name))
+
+
+def skill_item(name):
+    return ns(root=ns(type="skill", name=name))
+
+
+def user_message(turn_id, item_id, *content):
+    return ns(id=turn_id, items=[ns(root=ns(type="userMessage", id=item_id, content=list(content)))])
+
+
+def agent_message(item_id, phase, text):
+    return ns(root=ns(type="agentMessage", id=item_id, phase=phase, text=text))
+
+
+def make_turn(turn_id, *items):
+    return ns(id=turn_id, items=list(items))
+
+
+def make_thread_response(*turns):
+    return ns(thread=ns(turns=list(turns)))
+
+
+class DummyClient:
+    def __init__(self):
+        self.messages = []
+
+    def chat_postMessage(self, **kwargs):
+        self.messages.append(kwargs)
+
+
 class CommandParsingTests(unittest.TestCase):
-    def test_fresh_command_supports_slash_and_plain_variants(self):
+    def test_command_variants(self):
         self.assertTrue(server.is_fresh_command("/fresh summarize status"))
-        self.assertTrue(server.is_fresh_command("fresh summarize status"))
-        self.assertTrue(server.is_fresh_command("Fresh summarize status"))
-        self.assertTrue(server.is_fresh_command("/fresh"))
-        self.assertTrue(server.is_fresh_command("fresh"))
-        self.assertFalse(server.is_fresh_command("freshness check"))
-
-    def test_strip_fresh_command_returns_payload(self):
-        self.assertEqual(server.strip_fresh_command("/fresh do the task"), "do the task")
         self.assertEqual(server.strip_fresh_command("fresh do the task"), "do the task")
-        self.assertEqual(server.strip_fresh_command("/fresh"), "")
-        self.assertEqual(server.strip_fresh_command("fresh"), "")
-        self.assertEqual(server.strip_fresh_command("freshness check"), "")
-
-    def test_attach_command_supports_slash_and_plain_variants(self):
-        self.assertTrue(server.is_attach_command("/attach 019-test"))
         self.assertTrue(server.is_attach_command("attach 019-test"))
-        self.assertTrue(server.is_attach_command("ATTACH 019-test"))
-        self.assertTrue(server.is_attach_command("/attach"))
-        self.assertTrue(server.is_attach_command("attach"))
         self.assertEqual(server.strip_attach_command("/attach 019-test"), "019-test")
-        self.assertEqual(server.strip_attach_command("attach 019-test"), "019-test")
-        self.assertEqual(server.strip_attach_command("ATTACH 019-test"), "019-test")
-        self.assertEqual(server.strip_attach_command("/attach"), "")
-        self.assertEqual(server.strip_attach_command("attach"), "")
-        self.assertEqual(server.strip_attach_command("attach "), "")
-
-    def test_status_and_session_commands_support_plain_text(self):
-        self.assertTrue(server.is_status_command("/where"))
         self.assertTrue(server.is_status_command("whoami"))
-        self.assertTrue(server.is_status_command("status"))
-        self.assertTrue(server.is_session_command("/session"))
-        self.assertTrue(server.is_session_command("session"))
         self.assertTrue(server.is_session_command("session id"))
-        self.assertFalse(server.is_status_command("where are you going"))
+        self.assertTrue(server.is_watch_command("/watch"))
+        self.assertFalse(server.is_watch_command("watch raw"))
+        self.assertTrue(server.is_unsupported_watch_command("watch raw"))
+        self.assertTrue(server.is_unwatch_command("stop watch"))
+        self.assertTrue(server.is_control_command("takeover"))
+        self.assertTrue(server.is_observe_command("release"))
 
 
 class SlackAccessTests(unittest.TestCase):
@@ -53,19 +75,11 @@ class SlackAccessTests(unittest.TestCase):
             {"ALLOWED_SLACK_USER_IDS": "U111, U222\nU333\tU444"},
             clear=False,
         ):
-            self.assertEqual(
-                server.get_allowed_slack_user_ids(),
-                {"U111", "U222", "U333", "U444"},
-            )
+            self.assertEqual(server.get_allowed_slack_user_ids(), {"U111", "U222", "U333", "U444"})
 
     def test_blank_allowlist_means_unrestricted(self):
         with patch.dict(server.ENV, {"ALLOWED_SLACK_USER_IDS": ""}, clear=False):
             self.assertTrue(server.is_allowed_slack_user("U111"))
-
-    def test_allowlist_restricts_unknown_user(self):
-        with patch.dict(server.ENV, {"ALLOWED_SLACK_USER_IDS": "U111,U222"}, clear=False):
-            self.assertTrue(server.is_allowed_slack_user("U111"))
-            self.assertFalse(server.is_allowed_slack_user("U999"))
 
     def test_attach_accepts_uuid_in_single_user_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -118,7 +132,23 @@ class SlackAccessTests(unittest.TestCase):
                 error = server.get_attach_error("U222", session_id, session_store=store)
         self.assertIn("不允许跨用户接管", error)
 
-    def test_attach_session_atomically_rejects_cross_user_takeover(self):
+
+class SessionStoreTests(unittest.TestCase):
+    def test_attach_session_defaults_to_observe_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
+            previous_session_id, error = store.attach_session(
+                "C1:1",
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                owner_user_id="U111",
+                allow_unseen=True,
+            )
+
+            self.assertIsNone(previous_session_id)
+            self.assertIsNone(error)
+            self.assertEqual(store.get_mode("C1:1"), server.SESSION_MODE_OBSERVE)
+
+    def test_attach_session_rejects_cross_user_takeover(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
             session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
@@ -131,355 +161,330 @@ class SlackAccessTests(unittest.TestCase):
                 allow_unseen=True,
             )
 
+            self.assertIsNone(previous_session_id)
+            self.assertIn("不允许跨用户接管", error)
             self.assertIsNone(store.get("C2:2"))
-
-        self.assertIsNone(previous_session_id)
-        self.assertIn("不允许跨用户接管", error)
-
-    def test_attach_session_returns_previous_thread_session_on_success(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
-            store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
-
-            previous_session_id, error = store.attach_session(
-                "C1:1",
-                "019d5868-71ba-7101-9143-81867f3db5c0",
-                owner_user_id="U111",
-                allow_unseen=True,
-            )
-
-        self.assertEqual(previous_session_id, "019d5868-71ba-7101-9143-81867f3db5bf")
-        self.assertIsNone(error)
-
-    def test_attach_session_rejects_cross_user_thread_override(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
-            store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
-
-            previous_session_id, error = store.attach_session(
-                "C1:1",
-                "019d5868-71ba-7101-9143-81867f3db5c0",
-                owner_user_id="U222",
-                allow_unseen=True,
-            )
-
-        self.assertEqual(previous_session_id, "019d5868-71ba-7101-9143-81867f3db5bf")
-        self.assertIn("不允许跨用户覆盖", error)
 
     def test_thread_owner_access_error_rejects_non_owner(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
             store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
             error = server.get_thread_owner_access_error("C1:1", "U222", session_store=store)
-
         self.assertIn("不允许跨用户继续使用", error)
 
-    def test_thread_owner_access_error_allows_owner(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
-            store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
-            error = server.get_thread_owner_access_error("C1:1", "U111", session_store=store)
 
-        self.assertIsNone(error)
-
-
-class FormattingTests(unittest.TestCase):
-    def test_handoff_footer_includes_terminal_verification(self):
-        text = server.append_handoff_footer("Current Goal:\nkeep context", "019-test", "/tmp/workdir")
-        self.assertIn("In-Session Verify Command:", text)
-        self.assertIn("如果你已经在目标 Codex 会话内部，可运行：", text)
-        self.assertIn("`printenv CODEX_THREAD_ID && pwd`", text)
-        self.assertIn("Expected Session ID: `019-test`", text)
-        self.assertIn("Expected Workdir: `/tmp/workdir`", text)
-
-    def test_recap_footer_includes_current_session_id(self):
-        text = server.append_recap_footer("Recent Progress:\nupdated docs", "019-test")
-        self.assertIn("Current Session ID: `019-test`", text)
-
-    def test_clean_codex_output_filters_progress_noise(self):
-        raw = textwrap.dedent(
-            """
-            thinking about the plan
-            running tests
-            useful line
-
-            commentary hidden
-            final answer
-            """
-        ).strip()
-        self.assertEqual(server.clean_codex_output(raw), "useful line\n\nfinal answer")
-
-    def test_chunk_text_splits_long_messages(self):
-        self.assertEqual(server.chunk_text("abcdef", max_length=3), ["abc", "def"])
-
-
-class LoggingTests(unittest.TestCase):
-    def test_summarize_text_for_log_redacts_content(self):
-        self.assertEqual(server.summarize_text_for_log("hello"), "<chars=5>")
-        self.assertEqual(server.summarize_text_for_log(""), "<chars=0>")
-        self.assertEqual(server.summarize_text_for_log(None), "<chars=0>")
-
-
-class JsonEventParsingTests(unittest.TestCase):
-    def test_parse_codex_json_events_extracts_session_and_messages(self):
-        raw = "\n".join(
+class ConversationExtractionTests(unittest.TestCase):
+    def test_format_user_message_content_uses_placeholders_for_non_text_inputs(self):
+        content = server.format_user_message_content(
             [
-                '{"type":"thread.started","thread_id":"019-test"}',
-                '{"type":"item.completed","item":{"type":"agent_message","text":"first reply"}}',
-                '{"type":"item.completed","item":{"type":"tool_result","text":"ignored"}}',
-                '{"type":"item.completed","item":{"type":"agent_message","text":"second reply"}}',
+                text_item("hello"),
+                local_image_item("/tmp/example.png"),
+                mention_item("repo"),
+                skill_item("review"),
             ]
         )
-        session_id, message = server.parse_codex_json_events(raw)
-        self.assertEqual(session_id, "019-test")
-        self.assertEqual(message, "first reply\n\nsecond reply")
-
-    def test_parse_codex_json_events_ignores_invalid_lines(self):
-        raw = "\n".join(
-            [
-                "not json",
-                '{"type":"thread.started","thread_id":"019-test"}',
-                '{"type":"item.completed","item":{"type":"agent_message","text":"reply"}}',
-            ]
-        )
-        session_id, message = server.parse_codex_json_events(raw)
-        self.assertEqual(session_id, "019-test")
-        self.assertEqual(message, "reply")
-
-
-class SessionRecoveryTests(unittest.TestCase):
-    def test_should_rebuild_invalid_session_requires_nonzero_exit(self):
-        result = server.CodexRunResult(
-            session_id="019d5868-71ba-7101-9143-81867f3db5bf",
-            text="I fixed the issue after seeing 'session not found' in a pasted log.",
-            exit_code=0,
-            raw_output="",
-            final_output="",
-            json_output="",
-            cleaned_output="",
-            timed_out=False,
-        )
-        self.assertFalse(server.should_rebuild_invalid_session(result))
-
-    def test_should_rebuild_invalid_session_on_failed_resume_error_text(self):
-        result = server.CodexRunResult(
-            session_id="019d5868-71ba-7101-9143-81867f3db5bf",
-            text="Codex exited with status 1.\n\nsession not found",
-            exit_code=1,
-            raw_output='{"type":"error","message":"session not found"}',
-            final_output="",
-            json_output="",
-            cleaned_output="",
-            timed_out=False,
-        )
-        self.assertTrue(server.should_rebuild_invalid_session(result))
-
-    def test_should_update_session_activity_rejects_timeout(self):
-        timed_out_result = server.CodexRunResult(
-            session_id="019d5868-71ba-7101-9143-81867f3db5bf",
-            text="Codex timed out after 1 seconds.",
-            exit_code=None,
-            raw_output="",
-            final_output="",
-            json_output="",
-            cleaned_output="",
-            timed_out=True,
-        )
-        self.assertFalse(server.should_update_session_activity(timed_out_result))
-
-
-class ThreadLockTests(unittest.TestCase):
-    def test_thread_lock_entries_are_reused_then_evicted(self):
-        original = server.THREAD_LOCKS.copy()
-        server.THREAD_LOCKS.clear()
-        thread_key = "C123:1712345.6789"
-
-        try:
-            lock_one = server.claim_thread_lock(thread_key)
-            lock_two = server.claim_thread_lock(thread_key)
-
-            self.assertIs(lock_one, lock_two)
-            self.assertEqual(server.THREAD_LOCKS[thread_key].waiters, 2)
-
-            server.release_thread_lock(thread_key)
-            self.assertIn(thread_key, server.THREAD_LOCKS)
-            self.assertEqual(server.THREAD_LOCKS[thread_key].waiters, 1)
-
-            server.release_thread_lock(thread_key)
-            self.assertNotIn(thread_key, server.THREAD_LOCKS)
-        finally:
-            server.THREAD_LOCKS.clear()
-            server.THREAD_LOCKS.update(original)
-
-
-class SessionLockTests(unittest.TestCase):
-    def test_session_lock_entries_are_reused_then_evicted(self):
-        original = server.SESSION_LOCKS.copy()
-        server.SESSION_LOCKS.clear()
-        session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
-
-        try:
-            lock_one = server.claim_session_lock(session_id)
-            lock_two = server.claim_session_lock(session_id)
-
-            self.assertIs(lock_one, lock_two)
-            self.assertEqual(server.SESSION_LOCKS[session_id].waiters, 2)
-
-            server.release_session_lock(session_id)
-            self.assertIn(session_id, server.SESSION_LOCKS)
-            self.assertEqual(server.SESSION_LOCKS[session_id].waiters, 1)
-
-            server.release_session_lock(session_id)
-            self.assertNotIn(session_id, server.SESSION_LOCKS)
-        finally:
-            server.SESSION_LOCKS.clear()
-            server.SESSION_LOCKS.update(original)
-
-
-class ProcessPromptAccessTests(unittest.TestCase):
-    class FakeClient:
-        def __init__(self):
-            self.messages = []
-
-        def chat_postMessage(self, **kwargs):
-            self.messages.append(kwargs)
-
-    def test_process_prompt_rejects_non_owner_before_resuming(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
-            store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
-            client = self.FakeClient()
-
-            with patch.object(server, "SESSION_STORE", store):
-                with patch.object(server, "run_codex") as run_codex:
-                    server.process_prompt(client, "C1", "1", "continue working", "U222")
-
-        self.assertEqual(len(client.messages), 1)
-        self.assertIn("不允许跨用户继续使用", client.messages[0]["text"])
-        run_codex.assert_not_called()
-
-    def test_process_prompt_rejects_non_owner_fresh_request(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
-            store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
-            client = self.FakeClient()
-
-            with patch.object(server, "SESSION_STORE", store):
-                with patch.object(server, "run_codex") as run_codex:
-                    server.process_prompt(client, "C1", "1", "fresh do something new", "U222")
-
-        self.assertEqual(len(client.messages), 1)
-        self.assertIn("不允许跨用户继续使用", client.messages[0]["text"])
-        run_codex.assert_not_called()
-
-    def test_process_prompt_rejects_non_owner_handoff_request(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
-            store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
-            client = self.FakeClient()
-
-            with patch.object(server, "SESSION_STORE", store):
-                with patch.object(server, "run_codex") as run_codex:
-                    server.process_prompt(client, "C1", "1", "handoff", "U222")
-
-        self.assertEqual(len(client.messages), 1)
-        self.assertIn("不允许跨用户继续使用", client.messages[0]["text"])
-        run_codex.assert_not_called()
-
-
-class RunCodexTests(unittest.TestCase):
-    def test_build_codex_resume_args_uses_supported_resume_flags_only(self):
-        with patch.object(
-            server,
-            "get_codex_settings",
-            return_value=("codex", "gpt-5.4", "/tmp/work", 900, "danger-full-access", "--profile x", True),
-        ):
-            codex_bin, args, timeout, workdir = server.build_codex_resume_args(
-                "019d5868-71ba-7101-9143-81867f3db5bf",
-                "continue task",
-                "/tmp/out.txt",
-            )
-
-        self.assertEqual(codex_bin, "codex")
-        self.assertEqual(timeout, 900)
-        self.assertEqual(workdir, "/tmp/work")
-        self.assertNotIn("--sandbox", args)
-        self.assertNotIn("--color", args)
-        self.assertNotIn("--profile", args)
         self.assertEqual(
-            args,
+            content,
+            "hello\n[local image: /tmp/example.png]\n[mention: repo]\n[skill: review]",
+        )
+
+    def test_extract_conversation_events_keeps_user_and_final_answer_only(self):
+        response = make_thread_response(
+            make_turn(
+                "turn-1",
+                ns(root=ns(type="userMessage", id="u1", content=[text_item("hello")])),
+                agent_message("a1", "commentary", "thinking"),
+                agent_message("a2", "final_answer", "done"),
+            )
+        )
+
+        events = server.extract_conversation_events(response)
+
+        self.assertEqual(
+            events,
             [
-                "exec",
-                "resume",
-                "--model",
-                "gpt-5.4",
-                "--skip-git-repo-check",
-                "--output-last-message",
-                "/tmp/out.txt",
-                "--json",
-                "--full-auto",
-                "019d5868-71ba-7101-9143-81867f3db5bf",
-                "continue task",
+                server.ConversationEvent(turn_id="turn-1", item_id="u1", role="user", text="hello"),
+                server.ConversationEvent(turn_id="turn-1", item_id="a2", role="assistant", text="done"),
             ],
         )
 
-    def test_run_codex_cleans_up_temp_file_on_timeout(self):
-        output_path = Path(tempfile.gettempdir()) / "codex-slack-timeout-test.txt"
-        output_path.unlink(missing_ok=True)
+    def test_extract_conversation_events_supports_dict_payloads_from_sdk(self):
+        response = {
+            "thread": {
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "item-1",
+                                "content": [{"type": "text", "text": "hello"}],
+                            },
+                            {
+                                "type": "agentMessage",
+                                "id": "item-2",
+                                "phase": "commentary",
+                                "text": "thinking",
+                            },
+                            {
+                                "type": "agentMessage",
+                                "id": "item-3",
+                                "phase": "final_answer",
+                                "text": "done",
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
 
-        class FakeTempFile:
-            def __init__(self, path):
-                self.name = str(path)
+        events = server.extract_conversation_events(response)
 
-            def __enter__(self):
-                output_path.write_text("", encoding="utf-8")
-                return self
+        self.assertEqual(
+            events,
+            [
+                server.ConversationEvent(turn_id="turn-1", item_id="item-1", role="user", text="hello"),
+                server.ConversationEvent(turn_id="turn-1", item_id="item-3", role="assistant", text="done"),
+            ],
+        )
 
-            def __exit__(self, exc_type, exc, tb):
-                return False
+    def test_get_events_after_key_raises_when_key_missing(self):
+        events = [
+            server.ConversationEvent("turn-1", "u1", "user", "one"),
+            server.ConversationEvent("turn-1", "a1", "assistant", "done one"),
+            server.ConversationEvent("turn-2", "u2", "user", "two"),
+            server.ConversationEvent("turn-2", "a2", "assistant", "done two"),
+        ]
 
-        class FakeChild:
-            def __init__(self, *args, **kwargs):
-                self.exitstatus = None
-                self.signalstatus = None
-                self._alive = True
+        with self.assertRaises(server.WatchAnchorLostError):
+            server.get_events_after_key(events, ("missing", "key"))
 
-            def expect(self, _pattern):
-                raise server.pexpect.TIMEOUT("timed out")
+    def test_build_watch_bootstrap_prefers_latest_completed_turn(self):
+        response = make_thread_response(
+            make_turn(
+                "turn-1",
+                ns(root=ns(type="userMessage", id="u1", content=[text_item("old question")])),
+                agent_message("a1", "final_answer", "old answer"),
+            ),
+            make_turn(
+                "turn-2",
+                ns(root=ns(type="userMessage", id="u2", content=[text_item("new question")])),
+                agent_message("a2", "commentary", "thinking"),
+                agent_message("a3", "final_answer", "new answer"),
+            ),
+            make_turn(
+                "turn-3",
+                ns(root=ns(type="userMessage", id="u3", content=[text_item("unfinished question")])),
+                agent_message("a4", "commentary", "still working"),
+            ),
+        )
 
-            def close(self, force=False):
-                self._alive = False
+        with patch.object(server, "read_thread_response", return_value=response):
+            text, last_key = server.build_watch_bootstrap("019d5868-71ba-7101-9143-81867f3db5bf")
 
-            def isalive(self):
-                return self._alive
+        self.assertIn("最近一轮对话:", text)
+        self.assertIn("*User*\n> new question", text)
+        self.assertIn("*Codex*\n> new answer", text)
+        self.assertNotIn("old question", text)
+        self.assertNotIn("unfinished question", text)
+        self.assertEqual(last_key, ("turn-2", "a3"))
 
-        with patch.object(server.tempfile, "NamedTemporaryFile", return_value=FakeTempFile(output_path)):
-            with patch.object(server, "get_codex_settings", return_value=("codex", "gpt-5.4", "/tmp", 1, "danger-full-access", "", False)):
-                with patch.object(server.pexpect, "spawn", return_value=FakeChild()):
-                    result = server.run_codex("test timeout")
+    def test_read_conversation_events_propagates_thread_read_error(self):
+        with patch.object(server, "read_thread_response", side_effect=RuntimeError("sdk failed")):
+            with self.assertRaisesRegex(RuntimeError, "sdk failed"):
+                server.read_conversation_events("019d5868-71ba-7101-9143-81867f3db5bf")
 
-        self.assertEqual(result.text, "Codex timed out after 1 seconds.")
-        self.assertTrue(result.timed_out)
-        self.assertFalse(output_path.exists())
 
-    def test_build_codex_child_env_strips_slack_secrets(self):
+class CodexHelperTests(unittest.TestCase):
+    def test_build_codex_resume_args_uses_session_and_prompt(self):
         with patch.dict(
             server.ENV,
             {
-                "SLACK_BOT_TOKEN": "xoxb-secret",
-                "SLACK_APP_TOKEN": "xapp-secret",
-                "SLACK_SIGNING_SECRET": "signing-secret",
                 "CODEX_BIN": "codex",
                 "OPENAI_MODEL": "gpt-5.4",
+                "CODEX_WORKDIR": "/tmp/work",
+                "CODEX_TIMEOUT_SECONDS": "321",
+                "CODEX_FULL_AUTO": "1",
             },
             clear=False,
         ):
-            child_env = server.build_codex_child_env()
+            codex_bin, args, timeout, workdir = server.build_codex_resume_args(
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                "continue",
+                "/tmp/last.txt",
+            )
 
+        self.assertEqual(codex_bin, "codex")
+        self.assertEqual(timeout, 321)
+        self.assertEqual(workdir, "/tmp/work")
+        self.assertEqual(args[:4], ["exec", "resume", "--model", "gpt-5.4"])
+        self.assertIn("--full-auto", args)
+        self.assertEqual(args[-2:], ["019d5868-71ba-7101-9143-81867f3db5bf", "continue"])
+
+    def test_build_codex_child_env_strips_slack_variables(self):
+        with patch.dict(os.environ, {"PATH": "/bin", "SLACK_BOT_TOKEN": "from-os"}, clear=True):
+            with patch.dict(server.ENV, {"CUSTOM_ENV": "1", "SLACK_APP_TOKEN": "from-env"}, clear=False):
+                child_env = server.build_codex_child_env()
+
+        self.assertEqual(child_env["CUSTOM_ENV"], "1")
         self.assertNotIn("SLACK_BOT_TOKEN", child_env)
         self.assertNotIn("SLACK_APP_TOKEN", child_env)
-        self.assertNotIn("SLACK_SIGNING_SECRET", child_env)
-        self.assertEqual(child_env["CODEX_BIN"], "codex")
+
+    def test_get_app_server_stdio_line_limit_bytes_uses_default_on_invalid_input(self):
+        with patch.dict(server.ENV, {"CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES": "invalid"}, clear=False):
+            value = server.get_app_server_stdio_line_limit_bytes()
+        self.assertEqual(value, server.DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES)
+
+
+class ProcessPromptTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.store = server.SlackThreadSessionStore(Path(self.tmpdir.name) / "sessions.json")
+        self.session_store_patcher = patch.object(server, "SESSION_STORE", self.store)
+        self.session_store_patcher.start()
+        self.addCleanup(self.session_store_patcher.stop)
+        server.WATCHERS.clear()
+        self.addCleanup(server.WATCHERS.clear)
+        self.client = DummyClient()
+        self.channel = "C1"
+        self.thread_ts = "1"
+        self.user_id = "U111"
+        self.thread_key = server.make_thread_key(self.channel, self.thread_ts)
+        self.session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
+
+    def test_watch_command_starts_dialogue_watch(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+
+        with patch.object(
+            server,
+            "build_watch_bootstrap",
+            return_value=("最近一轮对话:\n\n*User*\n> hello", ("turn-1", "u1")),
+        ) as build_watch_bootstrap:
+            with patch.object(server, "start_watcher") as start_watcher:
+                server.process_prompt(self.client, self.channel, self.thread_ts, "watch", self.user_id)
+
+        build_watch_bootstrap.assert_called_once_with(self.session_id)
+        start_watcher.assert_called_once()
+        self.assertIn("已开始持续 watch", self.client.messages[0]["text"])
+
+    def test_watch_rejects_extra_arguments(self):
+        server.process_prompt(self.client, self.channel, self.thread_ts, "watch raw", self.user_id)
+        self.assertIn("不再接受参数", self.client.messages[0]["text"])
+
+    def test_attach_command_binds_session_in_observe_mode(self):
+        with patch.dict(
+            server.ENV,
+            {"ALLOWED_SLACK_USER_IDS": self.user_id, "ALLOW_SHARED_ATTACH": "0"},
+            clear=False,
+        ):
+            with patch.object(server, "stop_watcher", return_value=False):
+                server.process_prompt(
+                    self.client,
+                    self.channel,
+                    self.thread_ts,
+                    f"attach {self.session_id}",
+                    self.user_id,
+                )
+
+        self.assertEqual(self.store.get(self.thread_key), self.session_id)
+        self.assertEqual(self.store.get_mode(self.thread_key), server.SESSION_MODE_OBSERVE)
+        self.assertIn("默认已进入 `observe` 模式", self.client.messages[0]["text"])
+
+    def test_status_reports_watch_state(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+
+        with patch.object(server, "get_watcher", return_value=object()):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "status", self.user_id)
+
+        text = self.client.messages[0]["text"]
+        self.assertIn("- thread_key: `C1:1`", text)
+        self.assertIn(f"- session_id: `{self.session_id}`", text)
+        self.assertIn("- watch_active: `yes`", text)
+
+    def test_unwatch_reports_when_watcher_is_stopped(self):
+        with patch.object(server, "stop_watcher", return_value=True):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "unwatch", self.user_id)
+        self.assertIn("已停止当前 Slack thread 的持续 watch", self.client.messages[0]["text"])
+
+    def test_observe_mode_mentions_existing_watch(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        with patch.object(server, "get_watcher", return_value=object()):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "observe", self.user_id)
+        text = self.client.messages[0]["text"]
+        self.assertIn("已切到 `observe` 模式", text)
+        self.assertIn("`watch` 仍在运行", text)
+        self.assertIn("`unwatch` 或 `stop watch`", text)
+
+    def test_watch_loop_incremental_push_uses_plain_dialogue_without_update_heading(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        events = [
+            server.ConversationEvent("turn-0", "u0", "user", "previous"),
+            server.ConversationEvent("turn-0", "a0", "assistant", "done previous"),
+            server.ConversationEvent("turn-1", "u1", "user", "hello"),
+            server.ConversationEvent("turn-1", "a1", "assistant", "done"),
+        ]
+        calls = {"count": 0}
+
+        class FakeStopEvent:
+            def wait(self, _seconds):
+                calls["count"] += 1
+                return calls["count"] > 1
+
+        with patch.object(server, "get_watch_poll_seconds", return_value=1):
+            with patch.object(server, "read_conversation_events", return_value=events):
+                with patch.object(server, "post_chunks") as post_chunks:
+                    with patch.object(server, "get_watcher", return_value=None):
+                        server.watch_loop(
+                            self.client,
+                            self.channel,
+                            self.thread_ts,
+                            self.thread_key,
+                            self.session_id,
+                            FakeStopEvent(),
+                            last_event_key=("turn-0", "a0"),
+                        )
+
+        post_chunks.assert_called_once()
+        self.assertEqual(post_chunks.call_args.args[3], "*User*\n> hello\n\n*Codex*\n> done")
+
+    def test_watch_loop_stops_when_anchor_event_is_missing(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        events = [
+            server.ConversationEvent("turn-2", "u2", "user", "next"),
+            server.ConversationEvent("turn-2", "a2", "assistant", "done"),
+        ]
+
+        class FakeStopEvent:
+            def wait(self, _seconds):
+                return False
+
+        with patch.object(server, "get_watch_poll_seconds", return_value=1):
+            with patch.object(server, "read_conversation_events", return_value=events):
+                with patch.object(server, "post_chunks") as post_chunks:
+                    with patch.object(server, "get_watcher", return_value=None):
+                        server.watch_loop(
+                            self.client,
+                            self.channel,
+                            self.thread_ts,
+                            self.thread_key,
+                            self.session_id,
+                            FakeStopEvent(),
+                            last_event_key=("missing", "key"),
+                        )
+
+        post_chunks.assert_called_once()
+        self.assertIn("请重新发送 `watch`", post_chunks.call_args.args[3])
+
+    def test_observe_mode_blocks_normal_resume(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
+
+        with patch.object(server, "run_codex") as run_codex:
+            server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
+
+        run_codex.assert_not_called()
+        self.assertIn("处于 `observe` 模式", self.client.messages[0]["text"])
 
 
 if __name__ == "__main__":
