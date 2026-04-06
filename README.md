@@ -16,6 +16,7 @@
 - `attach` 后默认进入 `observe` 模式，避免和终端里的交互式 Codex 并发写入
 - 只有切到 `control` / `takeover` 模式后，Slack 普通消息才会继续 `resume` 当前 session
 - `watch` 会先回放最近一轮已完成的可显示对话，然后持续推送后续新增的用户消息和 `final_answer`
+- 支持按 Slack thread 设置 reasoning effort：`effort <level>`、`effort reset`、`fresh --effort <level> ...`
 - 支持白名单 `ALLOWED_SLACK_USER_IDS`
 - 同一个 session 会按 `session_id` 串行执行，避免多个 Slack thread 并发 `resume`
 
@@ -54,6 +55,7 @@ ALLOW_SHARED_ATTACH=0
 CODEX_BIN=codex
 CODEX_WORKDIR=/path/to/workdir
 CODEX_TIMEOUT_SECONDS=900
+CODEX_REASONING_EFFORT=xhigh
 CODEX_SANDBOX=danger-full-access
 CODEX_FULL_AUTO=0
 CODEX_EXTRA_ARGS=
@@ -73,6 +75,12 @@ CODEX_PROGRESS_POLL_SECONDS=15
 - 多用户共享 `attach` 需要显式设置 `ALLOW_SHARED_ATTACH=1`
 - 即使开启 `ALLOW_SHARED_ATTACH=1`，一旦某个 Slack thread 或 session 已经绑定给某个 Slack 用户，其他白名单用户也不能接管
 - `CODEX_TIMEOUT_SECONDS=0` 表示不设执行超时上限；适合超长任务
+- `CODEX_REASONING_EFFORT` 控制由 Slack 新建或自动重建的 session 默认 effort；只支持 `low|medium|high|xhigh`
+- 如果没有设置 `CODEX_REASONING_EFFORT`，Slack 新建或自动重建的 session 会默认使用 `xhigh`
+- `CODEX_WORKDIR` 控制由 Slack 新建或自动重建的 session 默认工作目录
+- 如果当前 Slack thread 是通过 `attach <session_id>` 绑定到一个已有 session，并且服务成功识别出该 session 的原始工作目录，那么后续 `control` / `takeover` 时会继续沿用那个目录，而不是强制切回 `CODEX_WORKDIR`
+- `attach` 一个已有 session 时，不会自动改动那个 session 原本的 effort；只有显式执行 `effort ...` 或 `fresh --effort ...` 才会覆盖
+- 当前不支持 `auto`、`none`、`minimal` 之类的 effort 值
 - `CODEX_SLACK_WATCH_POLL_SECONDS` 控制持续 watch 的轮询间隔，默认 5 秒
 - `CODEX_PROGRESS_HEARTBEAT_SECONDS` 控制长任务 heartbeat 间隔，默认 300 秒
 - `CODEX_PROGRESS_POLL_SECONDS` 控制长任务 progress 轮询间隔，默认 15 秒
@@ -150,8 +158,12 @@ python3 server.py
 
 - `reset` / `/reset`：清掉当前 Slack thread 的 session
 - `fresh <prompt>` / `/fresh <prompt>`：忽略旧 session，强制新建会话
+- `fresh --effort <level> <prompt>`：先把当前 Slack thread 的 effort override 设为 `<level>`，再强制新建会话
 - `session` / `/session`：查看当前 Slack thread 绑定的 session id
 - `attach <session_id>` / `/attach <session_id>`：把当前 Slack thread 绑定到已有 session，默认进入 `observe`
+- `effort`：查看当前 Slack thread 的 reasoning effort 状态
+- `effort <low|medium|high|xhigh>`：设置当前 Slack thread 后续由 Slack 发起 turns 的 effort
+- `effort reset`：清除当前 Slack thread 的 effort override
 - `where` / `whoami` / `status`：查看当前 thread 的绑定状态
 - `watch`：显示最近一轮对话，并持续推送后续新增对话
 - `unwatch` / `stop watch`：停止持续 watch
@@ -159,6 +171,24 @@ python3 server.py
 - `observe` / `release`：切回 `observe` 模式
 - `handoff`：基于当前 session 生成一份简短交接说明
 - `recap`：基于当前 session 生成一份简短进展总结
+
+## Reasoning Effort
+
+支持的 effort 值只有这四个：
+
+- `low`
+- `medium`
+- `high`
+- `xhigh`
+
+行为说明：
+
+- `effort <level>` 会给“当前 Slack thread”设置一个 override；后续由这个 Slack thread 发起的 turn 都会使用该值
+- `effort reset` 会清掉这个 override
+- 如果当前 thread 是通过 `attach <session_id>` 绑定到一个已有 session，并且没有设置 override，那么 Slack 后续 `resume` 会继续继承原 session 里的 effort，不会强行改成 `xhigh`
+- 如果当前 thread 是由 Slack 自己新建或自动重建出来的 session，则会使用 `CODEX_REASONING_EFFORT`；如果 `.env` 里没配，默认是 `xhigh`
+- `fresh --effort high <prompt>` 等价于“先设置当前 thread 的 override，再立即用这个 effort 新开一次会话”
+- `status` / `where` / `whoami` 会显示当前 thread 的 effort 状态，包括 thread override、`.env` 默认值，以及当前生效来源
 
 ## `attach` 和 `watch`
 
@@ -187,6 +217,7 @@ watch
 
 - `attach` 只负责把“当前 Slack thread”绑定到那个明确的 session
 - 绑定后默认是 `observe` 模式，适合“终端主控，手机旁路观察”
+- 如果服务识别到了该 session 的工作目录，那么之后 Slack `control` / `takeover` 时会继续沿用这个目录
 - `watch` 只显示 thread 对话里的用户消息和 agent `final_answer`
 - 当前 Slack thread 处于 `control` 模式时，不再启动 `watch`；因为后续回复本来就会直接发到这个 thread，继续镜像只会造成重复消息
 - `watch` 首次会回放最近一轮已完成的可显示对话；如果当前最新 turn 还没出 `final_answer`，会等后续增量推送

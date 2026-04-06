@@ -70,12 +70,32 @@ WATCHERS_GUARD = threading.Lock()
 INSTANCE_LOCK_HANDLE = None
 SESSION_MODE_OBSERVE = "observe"
 SESSION_MODE_CONTROL = "control"
+SESSION_ORIGIN_ATTACHED = "attached"
+SESSION_ORIGIN_SLACK = "slack"
+DEFAULT_REASONING_EFFORT = "xhigh"
+SUPPORTED_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 DEFAULT_WATCH_POLL_SECONDS = 5
 DEFAULT_PROGRESS_HEARTBEAT_SECONDS = 300
 DEFAULT_PROGRESS_POLL_SECONDS = 15
 MAX_APP_SERVER_RETRIES = 2
 MAX_WATCH_READ_FAILURES = 2
 DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES = 32 * 1024 * 1024
+
+
+def normalize_reasoning_effort(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in SUPPORTED_REASONING_EFFORTS:
+        return normalized
+    return None
+
+
+def format_reasoning_effort_values():
+    return "|".join(SUPPORTED_REASONING_EFFORTS)
+
+
+def normalize_session_cwd(value):
+    normalized = str(value or "").strip()
+    return normalized or None
 
 
 class SlackThreadSessionStore:
@@ -112,6 +132,15 @@ class SlackThreadSessionStore:
             owner_user_id = value.get("owner_user_id")
             if isinstance(owner_user_id, str) and owner_user_id:
                 entry["owner_user_id"] = owner_user_id
+            reasoning_effort = normalize_reasoning_effort(value.get("reasoning_effort"))
+            if reasoning_effort:
+                entry["reasoning_effort"] = reasoning_effort
+            session_origin = value.get("session_origin")
+            if session_origin in {SESSION_ORIGIN_ATTACHED, SESSION_ORIGIN_SLACK}:
+                entry["session_origin"] = session_origin
+            session_cwd = normalize_session_cwd(value.get("session_cwd"))
+            if session_cwd:
+                entry["session_cwd"] = session_cwd
             normalized[key] = entry
         return normalized
 
@@ -151,6 +180,32 @@ class SlackThreadSessionStore:
                 return None
             return entry.get("owner_user_id")
 
+    def get_reasoning_effort(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return normalize_reasoning_effort(entry.get("reasoning_effort"))
+
+    def get_session_origin(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            session_origin = entry.get("session_origin")
+            if session_origin in {SESSION_ORIGIN_ATTACHED, SESSION_ORIGIN_SLACK}:
+                return session_origin
+            if entry.get("session_id"):
+                return SESSION_ORIGIN_SLACK
+            return None
+
+    def get_session_cwd(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return normalize_session_cwd(entry.get("session_cwd"))
+
     def find_owner_for_session(self, session_id):
         with self._lock:
             for entry in self._sessions.values():
@@ -161,7 +216,7 @@ class SlackThreadSessionStore:
                     return owner_user_id
             return None
 
-    def set(self, key, session_id, owner_user_id=None):
+    def set(self, key, session_id, owner_user_id=None, session_origin=None, session_cwd=None):
         with self._lock:
             existing_entry = self._sessions.get(key, {})
             entry = {
@@ -172,13 +227,33 @@ class SlackThreadSessionStore:
             effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
             if effective_owner_user_id:
                 entry["owner_user_id"] = effective_owner_user_id
+            reasoning_effort = normalize_reasoning_effort(existing_entry.get("reasoning_effort"))
+            if reasoning_effort:
+                entry["reasoning_effort"] = reasoning_effort
+            effective_session_origin = session_origin or existing_entry.get("session_origin") or SESSION_ORIGIN_SLACK
+            if effective_session_origin in {SESSION_ORIGIN_ATTACHED, SESSION_ORIGIN_SLACK}:
+                entry["session_origin"] = effective_session_origin
+            effective_session_cwd = normalize_session_cwd(session_cwd) or normalize_session_cwd(
+                existing_entry.get("session_cwd")
+            )
+            if effective_session_cwd:
+                entry["session_cwd"] = effective_session_cwd
             self._sessions[key] = entry
             self._save_locked()
 
-    def attach_session(self, key, session_id, owner_user_id, allow_unseen=False, mode=SESSION_MODE_OBSERVE):
+    def attach_session(
+        self,
+        key,
+        session_id,
+        owner_user_id,
+        allow_unseen=False,
+        mode=SESSION_MODE_OBSERVE,
+        session_cwd=None,
+    ):
         with self._lock:
-            previous_session_id = self._sessions.get(key, {}).get("session_id")
-            existing_thread_owner_user_id = self._sessions.get(key, {}).get("owner_user_id")
+            existing_entry = self._sessions.get(key, {})
+            previous_session_id = existing_entry.get("session_id")
+            existing_thread_owner_user_id = existing_entry.get("owner_user_id")
             if existing_thread_owner_user_id and existing_thread_owner_user_id != owner_user_id:
                 return (
                     previous_session_id,
@@ -199,14 +274,68 @@ class SlackThreadSessionStore:
             if not current_owner_user_id and not allow_unseen:
                 return previous_session_id, get_shared_attach_error()
 
-            self._sessions[key] = {
+            entry = {
                 "session_id": session_id,
                 "updated_at": int(time.time()),
                 "owner_user_id": owner_user_id,
                 "mode": mode if mode in {SESSION_MODE_OBSERVE, SESSION_MODE_CONTROL} else SESSION_MODE_OBSERVE,
+                "session_origin": SESSION_ORIGIN_ATTACHED,
             }
+            reasoning_effort = normalize_reasoning_effort(existing_entry.get("reasoning_effort"))
+            if reasoning_effort:
+                entry["reasoning_effort"] = reasoning_effort
+            effective_session_cwd = normalize_session_cwd(session_cwd) or normalize_session_cwd(
+                existing_entry.get("session_cwd")
+            )
+            if effective_session_cwd:
+                entry["session_cwd"] = effective_session_cwd
+            self._sessions[key] = entry
             self._save_locked()
             return previous_session_id, None
+
+    def set_reasoning_effort(self, key, reasoning_effort, owner_user_id=None):
+        normalized_effort = normalize_reasoning_effort(reasoning_effort)
+        if not normalized_effort:
+            return
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["reasoning_effort"] = normalized_effort
+            existing_entry["updated_at"] = int(time.time())
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
+            if effective_owner_user_id:
+                existing_entry["owner_user_id"] = effective_owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
+
+    def clear_reasoning_effort(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return False
+            if "reasoning_effort" not in entry:
+                return False
+            entry.pop("reasoning_effort", None)
+            if entry.get("session_id"):
+                entry["updated_at"] = int(time.time())
+                self._save_locked()
+                return True
+            self._sessions.pop(key, None)
+            self._save_locked()
+            return True
+
+    def set_session_cwd(self, key, session_cwd, owner_user_id=None):
+        normalized_cwd = normalize_session_cwd(session_cwd)
+        if not normalized_cwd:
+            return
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["session_cwd"] = normalized_cwd
+            existing_entry["updated_at"] = int(time.time())
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
+            if effective_owner_user_id:
+                existing_entry["owner_user_id"] = effective_owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
 
     def set_mode(self, key, mode):
         if mode not in {SESSION_MODE_OBSERVE, SESSION_MODE_CONTROL}:
@@ -224,6 +353,22 @@ class SlackThreadSessionStore:
             if key in self._sessions:
                 del self._sessions[key]
                 self._save_locked()
+
+    def clear_session_binding(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return
+            entry.pop("session_id", None)
+            entry.pop("mode", None)
+            entry.pop("session_origin", None)
+            entry.pop("session_cwd", None)
+            entry["updated_at"] = int(time.time())
+            if entry.get("reasoning_effort") or entry.get("owner_user_id"):
+                self._save_locked()
+                return
+            self._sessions.pop(key, None)
+            self._save_locked()
 
     def touch(self, key):
         with self._lock:
@@ -404,6 +549,14 @@ def strip_attach_command(text):
     return strip_command_payload(text, "attach") or ""
 
 
+def is_effort_command(text):
+    return strip_command_payload(text, "effort") is not None
+
+
+def strip_effort_command(text):
+    return strip_command_payload(text, "effort") or ""
+
+
 def is_control_command(text):
     normalized = (text or "").strip().lower()
     return normalized in {"/control", "control", "/takeover", "takeover"}
@@ -418,10 +571,36 @@ def strip_fresh_command(text):
     return strip_command_payload(text, "fresh") or ""
 
 
+def parse_fresh_payload(payload):
+    normalized = (payload or "").strip()
+    if not normalized:
+        return None, "", None
+
+    if not normalized.lower().startswith("--effort"):
+        return None, normalized, None
+
+    match = re.match(r"^--effort(?:=|\s+)(\S+)(?:\s+(.*))?$", normalized, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None, normalized, (
+            f"`fresh --effort` 只支持 {format_reasoning_effort_values()}，例如 "
+            f"`fresh --effort high 修复测试失败`。"
+        )
+
+    reasoning_effort = normalize_reasoning_effort(match.group(1))
+    if not reasoning_effort:
+        return None, normalized, (
+            f"`fresh --effort` 只支持 {format_reasoning_effort_values()}，例如 "
+            f"`fresh --effort high 修复测试失败`。"
+        )
+
+    prompt = (match.group(2) or "").strip()
+    return reasoning_effort, prompt, None
+
+
 def get_codex_settings():
     codex_bin = ENV.get("CODEX_BIN", "codex")
     model = ENV.get("OPENAI_MODEL", "gpt-5.4")
-    workdir = ENV.get("CODEX_WORKDIR", str(Path.cwd()))
+    workdir = get_default_workdir()
     timeout_raw = ENV.get("CODEX_TIMEOUT_SECONDS", "900")
     try:
         timeout = int(timeout_raw)
@@ -431,6 +610,18 @@ def get_codex_settings():
     extra_args = ENV.get("CODEX_EXTRA_ARGS", "").strip()
     full_auto = ENV.get("CODEX_FULL_AUTO", "0") == "1"
     return codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto
+
+
+def get_default_workdir():
+    return ENV.get("CODEX_WORKDIR", str(Path.cwd()))
+
+
+def get_configured_reasoning_effort():
+    return normalize_reasoning_effort(ENV.get("CODEX_REASONING_EFFORT", ""))
+
+
+def get_default_reasoning_effort():
+    return get_configured_reasoning_effort() or DEFAULT_REASONING_EFFORT
 
 
 def get_app_server_stdio_line_limit_bytes():
@@ -548,6 +739,82 @@ def get_session_mode(thread_key, session_store=None):
     return session_store.get_mode(thread_key) or SESSION_MODE_CONTROL
 
 
+def get_session_origin(thread_key, session_store=None):
+    session_store = session_store or SESSION_STORE
+    return session_store.get_session_origin(thread_key)
+
+
+def get_session_cwd(thread_key, session_store=None):
+    session_store = session_store or SESSION_STORE
+    return session_store.get_session_cwd(thread_key)
+
+
+def extract_thread_cwd(thread_read_response):
+    thread = read_field(thread_read_response, "thread", thread_read_response)
+    return normalize_session_cwd(read_field(thread, "cwd"))
+
+
+def read_thread_cwd(session_id):
+    return extract_thread_cwd(read_thread_response(session_id))
+
+
+def refresh_session_cwd(thread_key, session_id, owner_user_id=None, session_store=None):
+    session_store = session_store or SESSION_STORE
+    if not session_id:
+        return session_store.get_session_cwd(thread_key)
+
+    try:
+        session_cwd = read_thread_cwd(session_id)
+    except Exception:
+        return session_store.get_session_cwd(thread_key)
+
+    if session_cwd:
+        session_store.set_session_cwd(thread_key, session_cwd, owner_user_id=owner_user_id)
+    return session_cwd or session_store.get_session_cwd(thread_key)
+
+
+def resolve_workdir(thread_key, session_id=None, session_cwd=None, session_store=None):
+    session_store = session_store or SESSION_STORE
+    if session_id:
+        return normalize_session_cwd(session_cwd) or session_store.get_session_cwd(thread_key) or get_default_workdir()
+    return get_default_workdir()
+
+
+def resolve_reasoning_effort(thread_key, session_id=None, session_origin=None, session_store=None):
+    session_store = session_store or SESSION_STORE
+    thread_reasoning_effort = session_store.get_reasoning_effort(thread_key)
+    if thread_reasoning_effort:
+        return thread_reasoning_effort, "thread"
+
+    effective_session_id = session_id if session_id is not None else session_store.get(thread_key)
+    effective_session_origin = session_origin if session_origin is not None else session_store.get_session_origin(thread_key)
+    if effective_session_id and effective_session_origin == SESSION_ORIGIN_ATTACHED:
+        return None, "inherited"
+
+    env_reasoning_effort = get_configured_reasoning_effort()
+    if env_reasoning_effort:
+        return env_reasoning_effort, "env"
+
+    return get_default_reasoning_effort(), "default"
+
+
+def format_effective_reasoning_effort(reasoning_effort, source):
+    if source == "inherited":
+        return "inherited"
+    if not reasoning_effort:
+        return "-"
+    if source in {"thread", "env", "default"}:
+        return f"{reasoning_effort} ({source})"
+    return reasoning_effort
+
+
+def build_reasoning_effort_args(reasoning_effort):
+    normalized = normalize_reasoning_effort(reasoning_effort)
+    if not normalized:
+        return []
+    return ["--config", f'model_reasoning_effort="{normalized}"']
+
+
 def get_observe_mode_error(user_id, session_id):
     return (
         f"<@{user_id}> 当前 Slack thread 绑定的 session `{session_id or '-'}` 处于 `observe` 模式。"
@@ -556,8 +823,60 @@ def get_observe_mode_error(user_id, session_id):
     )
 
 
-def build_codex_exec_args(prompt, output_file, extra_cli_args=None):
-    codex_bin, model, workdir, timeout, sandbox, extra_args, full_auto = get_codex_settings()
+def get_reasoning_effort_state_lines(thread_key, session_id=None, session_origin=None, session_store=None):
+    session_store = session_store or SESSION_STORE
+    thread_reasoning_effort = session_store.get_reasoning_effort(thread_key)
+    env_reasoning_effort = get_configured_reasoning_effort()
+    effective_reasoning_effort, effective_source = resolve_reasoning_effort(
+        thread_key,
+        session_id=session_id,
+        session_origin=session_origin,
+        session_store=session_store,
+    )
+    return [
+        f"- thread_reasoning_effort: `{thread_reasoning_effort or '-'}`",
+        f"- env_reasoning_effort: `{env_reasoning_effort or '-'}`",
+        f"- effective_reasoning_effort: `{format_effective_reasoning_effort(effective_reasoning_effort, effective_source)}`",
+    ]
+
+
+def get_reasoning_effort_set_message(thread_key, reasoning_effort, session_id=None, session_origin=None, session_store=None):
+    session_store = session_store or SESSION_STORE
+    current_session_origin = session_origin if session_origin is not None else session_store.get_session_origin(thread_key)
+    suffix = (
+        "后续由这个 Slack thread 发起的 turns 会使用该值。"
+        if not session_id or current_session_origin != SESSION_ORIGIN_ATTACHED
+        else "后续由这个 Slack thread 发起的 turns 会使用该值，并覆盖这个已 attach 会话原本继承的 effort。"
+    )
+    return (
+        f"已将当前 Slack thread 的 reasoning effort 设为 `{reasoning_effort}`。\n\n"
+        f"{suffix}"
+    )
+
+
+def get_reasoning_effort_reset_message(thread_key, session_id=None, session_origin=None, session_store=None):
+    session_store = session_store or SESSION_STORE
+    effective_reasoning_effort, effective_source = resolve_reasoning_effort(
+        thread_key,
+        session_id=session_id,
+        session_origin=session_origin,
+        session_store=session_store,
+    )
+    if effective_source == "inherited":
+        fallback_text = "由于这是一个 attach 进来的已有 session，后续由 Slack 发起的 turns 会继续继承原 session 的 effort 设置。"
+    elif effective_source == "env":
+        fallback_text = f"后续由 Slack 发起的 turns 会回退到 `.env` 中的默认值 `{effective_reasoning_effort}`。"
+    else:
+        fallback_text = f"后续由 Slack 发起的 turns 会回退到默认值 `{effective_reasoning_effort}`。"
+    return (
+        "已清除当前 Slack thread 的 reasoning effort override。\n\n"
+        f"{fallback_text}"
+    )
+
+
+def build_codex_exec_args(prompt, output_file, extra_cli_args=None, reasoning_effort=None, workdir_override=None):
+    codex_bin, model, default_workdir, timeout, sandbox, extra_args, full_auto = get_codex_settings()
+    workdir = normalize_session_cwd(workdir_override) or default_workdir
     args = [
         "exec",
         "--model",
@@ -582,12 +901,21 @@ def build_codex_exec_args(prompt, output_file, extra_cli_args=None):
     if extra_cli_args:
         args.extend(extra_cli_args)
 
+    args.extend(build_reasoning_effort_args(reasoning_effort))
     args.append(prompt)
     return codex_bin, args, timeout, workdir
 
 
-def build_codex_resume_args(session_id, prompt, output_file, extra_cli_args=None):
-    codex_bin, model, workdir, timeout, _sandbox, _extra_args, full_auto = get_codex_settings()
+def build_codex_resume_args(
+    session_id,
+    prompt,
+    output_file,
+    extra_cli_args=None,
+    reasoning_effort=None,
+    workdir_override=None,
+):
+    codex_bin, model, default_workdir, timeout, _sandbox, extra_args, full_auto = get_codex_settings()
+    workdir = normalize_session_cwd(workdir_override) or default_workdir
     args = [
         "exec",
         "resume",
@@ -600,8 +928,11 @@ def build_codex_resume_args(session_id, prompt, output_file, extra_cli_args=None
     ]
     if full_auto:
         args.append("--full-auto")
+    if extra_args:
+        args.extend(shlex.split(extra_args))
     if extra_cli_args:
         args.extend(extra_cli_args)
+    args.extend(build_reasoning_effort_args(reasoning_effort))
     args.extend([session_id, prompt])
     return codex_bin, args, timeout, workdir
 
@@ -856,17 +1187,28 @@ def stream_codex_json_output(process, timeout, session_id_tracker=None):
     return "".join(raw_lines), parsed_session_id, json_output, timed_out
 
 
-def run_codex(prompt, session_id=None, session_id_tracker=None):
+def run_codex(prompt, session_id=None, session_id_tracker=None, reasoning_effort=None, workdir_override=None):
     with tempfile.NamedTemporaryFile(prefix="codex-last-message-", suffix=".txt", delete=False) as tmp:
         output_file = tmp.name
 
     try:
         mode = "resume" if session_id else "new"
         if session_id:
-            codex_bin, args, timeout, workdir = build_codex_resume_args(session_id, prompt, output_file)
+            codex_bin, args, timeout, workdir = build_codex_resume_args(
+                session_id,
+                prompt,
+                output_file,
+                reasoning_effort=reasoning_effort,
+                workdir_override=workdir_override,
+            )
             log_codex_command(mode, workdir, [codex_bin, *args])
         else:
-            codex_bin, args, timeout, workdir = build_codex_exec_args(prompt, output_file)
+            codex_bin, args, timeout, workdir = build_codex_exec_args(
+                prompt,
+                output_file,
+                reasoning_effort=reasoning_effort,
+                workdir_override=workdir_override,
+            )
             log_codex_command(mode, workdir, [codex_bin, *args])
 
         if session_id_tracker and session_id:
@@ -1285,7 +1627,16 @@ def maybe_post_progress_updates(client, channel, thread_ts, session_id, previous
         post_chunks(client, channel, thread_ts, message)
 
 
-def run_codex_with_updates(client, channel, thread_ts, prompt, session_id=None, enable_progress=False):
+def run_codex_with_updates(
+    client,
+    channel,
+    thread_ts,
+    prompt,
+    session_id=None,
+    enable_progress=False,
+    reasoning_effort=None,
+    workdir_override=None,
+):
     result_box = {}
     error_box = {}
     session_id_tracker = SessionIdTracker(session_id=session_id)
@@ -1296,6 +1647,8 @@ def run_codex_with_updates(client, channel, thread_ts, prompt, session_id=None, 
                 prompt,
                 session_id=session_id,
                 session_id_tracker=session_id_tracker,
+                reasoning_effort=reasoning_effort,
+                workdir_override=workdir_override,
             )
         except Exception as exc:  # pragma: no cover
             error_box["error"] = exc
@@ -1467,6 +1820,76 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
 
                 current_session_id = SESSION_STORE.get(thread_key)
                 current_session_mode = get_session_mode(thread_key)
+                current_session_origin = get_session_origin(thread_key)
+                current_session_cwd = get_session_cwd(thread_key)
+
+                if is_effort_command(prompt):
+                    effort_payload = strip_effort_command(prompt)
+                    current_thread_reasoning_effort = SESSION_STORE.get_reasoning_effort(thread_key)
+
+                    if not effort_payload:
+                        lines = [f"<@{user_id}> 当前 Slack thread 的 reasoning effort 状态:\n"]
+                        lines.append(f"- session_id: `{current_session_id or '-'}`")
+                        lines.append(f"- session_origin: `{current_session_origin or '-'}`")
+                        lines.append(f"- session_cwd: `{current_session_cwd or '-'}`")
+                        lines.extend(get_reasoning_effort_state_lines(
+                            thread_key,
+                            session_id=current_session_id,
+                            session_origin=current_session_origin,
+                        ))
+                        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(lines))
+                        return
+
+                    if effort_payload.lower() == "reset":
+                        if not current_thread_reasoning_effort:
+                            client.chat_postMessage(
+                                channel=channel,
+                                thread_ts=thread_ts,
+                                text=f"<@{user_id}> 当前 Slack thread 还没有显式的 reasoning effort override。",
+                            )
+                            return
+                        SESSION_STORE.clear_reasoning_effort(thread_key)
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=(
+                                f"<@{user_id}> "
+                                + get_reasoning_effort_reset_message(
+                                    thread_key,
+                                    session_id=current_session_id,
+                                    session_origin=current_session_origin,
+                                )
+                            ),
+                        )
+                        return
+
+                    reasoning_effort = normalize_reasoning_effort(effort_payload)
+                    if not reasoning_effort:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=(
+                                f"<@{user_id}> `effort` 只支持 {format_reasoning_effort_values()}。"
+                                " 例如 `effort high`。"
+                            ),
+                        )
+                        return
+
+                    SESSION_STORE.set_reasoning_effort(thread_key, reasoning_effort, owner_user_id=user_id)
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f"<@{user_id}> "
+                            + get_reasoning_effort_set_message(
+                                thread_key,
+                                reasoning_effort,
+                                session_id=current_session_id,
+                                session_origin=current_session_origin,
+                            )
+                        ),
+                    )
+                    return
 
                 if is_handoff_command(prompt):
                     if not current_session_id:
@@ -1489,7 +1912,25 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         thread_ts=thread_ts,
                         text=f"<@{user_id}> 正在基于当前 session 整理 handoff note，请稍等。",
                     )
-                    workdir = ENV.get("CODEX_WORKDIR", str(Path.cwd()))
+                    workdir = (
+                        refresh_session_cwd(
+                            thread_key,
+                            current_session_id,
+                            owner_user_id=user_id,
+                        )
+                        if current_session_id
+                        else None
+                    )
+                    workdir = resolve_workdir(
+                        thread_key,
+                        session_id=current_session_id,
+                        session_cwd=workdir,
+                    )
+                    reasoning_effort, _effort_source = resolve_reasoning_effort(
+                        thread_key,
+                        session_id=current_session_id,
+                        session_origin=current_session_origin,
+                    )
                     with session_execution_guard(current_session_id):
                         codex_result = run_codex_with_updates(
                             client,
@@ -1498,6 +1939,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             build_handoff_prompt(),
                             session_id=current_session_id,
                             enable_progress=False,
+                            reasoning_effort=reasoning_effort,
+                            workdir_override=workdir,
                         )
                     next_session_id = codex_result.session_id
                     result = append_handoff_footer(codex_result.text, next_session_id or current_session_id, workdir)
@@ -1509,7 +1952,13 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         flush=True,
                     )
                     if should_update_session_activity(codex_result) and next_session_id != current_session_id:
-                        SESSION_STORE.set(thread_key, next_session_id, owner_user_id=user_id)
+                        SESSION_STORE.set(
+                            thread_key,
+                            next_session_id,
+                            owner_user_id=user_id,
+                            session_origin=current_session_origin or SESSION_ORIGIN_SLACK,
+                            session_cwd=workdir,
+                        )
                     elif should_update_session_activity(codex_result):
                         SESSION_STORE.touch(thread_key)
                     log_session_event(
@@ -1542,6 +1991,25 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         thread_ts=thread_ts,
                         text=f"<@{user_id}> 正在整理当前 session 的 recap，请稍等。",
                     )
+                    reasoning_effort, _effort_source = resolve_reasoning_effort(
+                        thread_key,
+                        session_id=current_session_id,
+                        session_origin=current_session_origin,
+                    )
+                    workdir = (
+                        refresh_session_cwd(
+                            thread_key,
+                            current_session_id,
+                            owner_user_id=user_id,
+                        )
+                        if current_session_id
+                        else None
+                    )
+                    workdir = resolve_workdir(
+                        thread_key,
+                        session_id=current_session_id,
+                        session_cwd=workdir,
+                    )
                     with session_execution_guard(current_session_id):
                         codex_result = run_codex_with_updates(
                             client,
@@ -1550,6 +2018,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             build_recap_prompt(),
                             session_id=current_session_id,
                             enable_progress=False,
+                            reasoning_effort=reasoning_effort,
+                            workdir_override=workdir,
                         )
                     next_session_id = codex_result.session_id
                     result = append_recap_footer(codex_result.text, next_session_id or current_session_id)
@@ -1561,7 +2031,13 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         flush=True,
                     )
                     if should_update_session_activity(codex_result) and next_session_id != current_session_id:
-                        SESSION_STORE.set(thread_key, next_session_id, owner_user_id=user_id)
+                        SESSION_STORE.set(
+                            thread_key,
+                            next_session_id,
+                            owner_user_id=user_id,
+                            session_origin=current_session_origin or SESSION_ORIGIN_SLACK,
+                            session_cwd=workdir,
+                        )
                     elif should_update_session_activity(codex_result):
                         SESSION_STORE.touch(thread_key)
                     log_session_event(
@@ -1689,8 +2165,18 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     return
 
                 if is_status_command(prompt):
-                    codex_bin, model, workdir, timeout, sandbox, _extra_args, _full_auto = get_codex_settings()
+                    codex_bin, model, default_workdir, timeout, sandbox, _extra_args, _full_auto = get_codex_settings()
                     watch_active = "yes" if get_watcher(thread_key) else "no"
+                    effective_workdir = resolve_workdir(
+                        thread_key,
+                        session_id=current_session_id,
+                        session_cwd=current_session_cwd,
+                    )
+                    reasoning_lines = get_reasoning_effort_state_lines(
+                        thread_key,
+                        session_id=current_session_id,
+                        session_origin=current_session_origin,
+                    )
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
@@ -1699,12 +2185,17 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             f"- thread_key: `{thread_key}`\n"
                             f"- session_id: `{current_session_id or '-'}`\n"
                             f"- session_mode: `{current_session_mode if current_session_id else '-'}`\n"
+                            f"- session_origin: `{current_session_origin or '-'}`\n"
                             f"- model: `{model}`\n"
-                            f"- workdir: `{workdir}`\n"
+                            f"- workdir: `{effective_workdir}`\n"
+                            f"- default_workdir: `{default_workdir}`\n"
+                            f"- session_cwd: `{current_session_cwd or '-'}`\n"
                             f"- sandbox: `{sandbox or '-'}`\n"
                             f"- timeout_seconds: `{timeout}`\n"
                             f"- codex_bin: `{codex_bin}`\n"
                             f"- watch_active: `{watch_active}`\n"
+                            + "\n".join(reasoning_lines)
+                            + "\n"
                             "如果你想让终端继续同一个会话，可以在终端里使用这个 `session_id` 执行 `codex exec resume ...`。"
                         ),
                     )
@@ -1726,6 +2217,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     attach_session_id = strip_attach_command(prompt)
                     normalized_session_id = (attach_session_id or "").strip()
                     previous_session_id = None
+                    attached_session_cwd = None
+                    attach_cwd_note = ""
                     if not normalized_session_id:
                         attach_error = "请用 `attach <session_id>` 绑定一个已有的 Codex 会话。"
                     elif not is_valid_attach_session_id(normalized_session_id):
@@ -1734,16 +2227,30 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             "`attach 019d5868-71ba-7101-9143-81867f3db5bf`。"
                         )
                     else:
+                        with suppress(Exception):
+                            attached_session_cwd = read_thread_cwd(normalized_session_id)
                         previous_session_id, attach_error = SESSION_STORE.attach_session(
                             thread_key,
                             normalized_session_id,
                             owner_user_id=user_id,
                             allow_unseen=is_unseen_attach_allowed(user_id),
                             mode=SESSION_MODE_OBSERVE,
+                            session_cwd=attached_session_cwd,
                         )
                     if attach_error:
                         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=attach_error)
                         return
+
+                    if attached_session_cwd:
+                        attach_cwd_note = (
+                            f"\n\n已识别这个 session 的工作目录：`{attached_session_cwd}`。"
+                            " 之后如果你在 Slack 里 `control` / `takeover`，会继续沿用这个目录。"
+                        )
+                    else:
+                        attach_cwd_note = (
+                            "\n\n暂时还没读到这个 session 的工作目录。"
+                            " 如果之后你在 Slack 里 `control` / `takeover`，服务会再尝试自动获取。"
+                        )
 
                     log_session_event(
                         "attach",
@@ -1759,6 +2266,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             f"<@{user_id}> 当前 Slack thread 已绑定到 Codex session `{normalized_session_id}`。\n\n"
                             "默认已进入 `observe` 模式。你可以先用 `watch`、`where`、`session` 查看 thread 对话。"
                             " 如果你确认要由 Slack 接管，再发送 `control` 或 `takeover`。"
+                            f"{attach_cwd_note}"
                         ),
                     )
                     return
@@ -1776,7 +2284,17 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     return
 
                 force_fresh = is_fresh_command(prompt)
-                effective_prompt = strip_fresh_command(prompt) if force_fresh else prompt
+                fresh_reasoning_effort = None
+                effective_prompt = prompt
+                if force_fresh:
+                    fresh_reasoning_effort, effective_prompt, fresh_error = parse_fresh_payload(strip_fresh_command(prompt))
+                    if fresh_error:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> {fresh_error}",
+                        )
+                        return
                 if not effective_prompt:
                     client.chat_postMessage(
                         channel=channel,
@@ -1784,6 +2302,9 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         text="`/fresh` 后面要跟具体任务。",
                     )
                     return
+
+                if fresh_reasoning_effort:
+                    SESSION_STORE.set_reasoning_effort(thread_key, fresh_reasoning_effort, owner_user_id=user_id)
 
                 existing_session_id = None if force_fresh else current_session_id
                 if existing_session_id and current_session_mode != SESSION_MODE_CONTROL:
@@ -1809,6 +2330,27 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     ),
                 )
 
+                run_session_origin = current_session_origin if existing_session_id else SESSION_ORIGIN_SLACK
+                runtime_session_cwd = (
+                    refresh_session_cwd(
+                        thread_key,
+                        existing_session_id,
+                        owner_user_id=user_id,
+                    )
+                    if existing_session_id
+                    else None
+                )
+                run_workdir = resolve_workdir(
+                    thread_key,
+                    session_id=existing_session_id,
+                    session_cwd=runtime_session_cwd,
+                )
+                reasoning_effort, _effort_source = resolve_reasoning_effort(
+                    thread_key,
+                    session_id=existing_session_id,
+                    session_origin=run_session_origin,
+                )
+
                 with session_execution_guard(existing_session_id):
                     codex_result = run_codex_with_updates(
                         client,
@@ -1817,6 +2359,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         effective_prompt,
                         session_id=existing_session_id,
                         enable_progress=True,
+                        reasoning_effort=reasoning_effort,
+                        workdir_override=run_workdir,
                     )
                     next_session_id = codex_result.session_id
                     result = codex_result.text
@@ -1832,11 +2376,16 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             thread_key,
                             existing_session_id=existing_session_id,
                         )
-                        SESSION_STORE.delete(thread_key)
+                        SESSION_STORE.clear_session_binding(thread_key)
                         client.chat_postMessage(
                             channel=channel,
                             thread_ts=thread_ts,
                             text=f"<@{user_id}> 当前 Slack thread 的 Codex 会话不可恢复，正在自动重建新会话。",
+                        )
+                        rebuilt_reasoning_effort, _rebuilt_effort_source = resolve_reasoning_effort(
+                            thread_key,
+                            session_id=None,
+                            session_origin=SESSION_ORIGIN_SLACK,
                         )
                         codex_result = run_codex_with_updates(
                             client,
@@ -1844,9 +2393,12 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             thread_ts,
                             effective_prompt,
                             enable_progress=True,
+                            reasoning_effort=rebuilt_reasoning_effort,
+                            workdir_override=run_workdir,
                         )
                         next_session_id = codex_result.session_id
                         result = codex_result.text
+                        run_session_origin = SESSION_ORIGIN_SLACK
                         print(
                             "[codex_result]"
                             f" thread_key={thread_key}"
@@ -1856,7 +2408,13 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         )
 
                 if should_update_session_activity(codex_result) and next_session_id != existing_session_id:
-                    SESSION_STORE.set(thread_key, next_session_id, owner_user_id=user_id)
+                    SESSION_STORE.set(
+                        thread_key,
+                        next_session_id,
+                        owner_user_id=user_id,
+                        session_origin=run_session_origin,
+                        session_cwd=run_workdir,
+                    )
                 elif should_update_session_activity(codex_result):
                     SESSION_STORE.touch(thread_key)
 

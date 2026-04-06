@@ -59,6 +59,8 @@ class CommandParsingTests(unittest.TestCase):
         self.assertEqual(server.strip_fresh_command("fresh do the task"), "do the task")
         self.assertTrue(server.is_attach_command("attach 019-test"))
         self.assertEqual(server.strip_attach_command("/attach 019-test"), "019-test")
+        self.assertTrue(server.is_effort_command("effort high"))
+        self.assertEqual(server.strip_effort_command("/effort reset"), "reset")
         self.assertTrue(server.is_status_command("whoami"))
         self.assertTrue(server.is_session_command("session id"))
         self.assertTrue(server.is_watch_command("/watch"))
@@ -67,6 +69,18 @@ class CommandParsingTests(unittest.TestCase):
         self.assertTrue(server.is_unwatch_command("stop watch"))
         self.assertTrue(server.is_control_command("takeover"))
         self.assertTrue(server.is_observe_command("release"))
+
+    def test_parse_fresh_payload_supports_reasoning_effort(self):
+        effort, prompt, error = server.parse_fresh_payload("--effort high fix flaky test")
+        self.assertEqual(effort, "high")
+        self.assertEqual(prompt, "fix flaky test")
+        self.assertIsNone(error)
+
+    def test_parse_fresh_payload_rejects_invalid_reasoning_effort(self):
+        effort, prompt, error = server.parse_fresh_payload("--effort auto fix flaky test")
+        self.assertIsNone(effort)
+        self.assertEqual(prompt, "--effort auto fix flaky test")
+        self.assertIn("low|medium|high|xhigh", error)
 
 
 class SlackAccessTests(unittest.TestCase):
@@ -135,6 +149,25 @@ class SlackAccessTests(unittest.TestCase):
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_set_and_reload_preserves_reasoning_effort_session_origin_and_cwd(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.json"
+            store = server.SlackThreadSessionStore(path)
+            store.set_reasoning_effort("C1:1", "high", owner_user_id="U111")
+            store.set(
+                "C1:1",
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                owner_user_id="U111",
+                session_origin=server.SESSION_ORIGIN_ATTACHED,
+                session_cwd="/tmp/project-a",
+            )
+
+            reloaded = server.SlackThreadSessionStore(path)
+
+        self.assertEqual(reloaded.get_reasoning_effort("C1:1"), "high")
+        self.assertEqual(reloaded.get_session_origin("C1:1"), server.SESSION_ORIGIN_ATTACHED)
+        self.assertEqual(reloaded.get_session_cwd("C1:1"), "/tmp/project-a")
+
     def test_attach_session_defaults_to_observe_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
@@ -148,6 +181,39 @@ class SessionStoreTests(unittest.TestCase):
             self.assertIsNone(previous_session_id)
             self.assertIsNone(error)
             self.assertEqual(store.get_mode("C1:1"), server.SESSION_MODE_OBSERVE)
+
+    def test_attach_session_preserves_existing_reasoning_effort(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
+            store.set_reasoning_effort("C1:1", "medium", owner_user_id="U111")
+
+            previous_session_id, error = store.attach_session(
+                "C1:1",
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                owner_user_id="U111",
+                allow_unseen=True,
+            )
+
+        self.assertIsNone(previous_session_id)
+        self.assertIsNone(error)
+        self.assertEqual(store.get_reasoning_effort("C1:1"), "medium")
+        self.assertEqual(store.get_session_origin("C1:1"), server.SESSION_ORIGIN_ATTACHED)
+
+    def test_attach_session_stores_session_cwd(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
+
+            previous_session_id, error = store.attach_session(
+                "C1:1",
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                owner_user_id="U111",
+                allow_unseen=True,
+                session_cwd="/tmp/project-b",
+            )
+
+        self.assertIsNone(previous_session_id)
+        self.assertIsNone(error)
+        self.assertEqual(store.get_session_cwd("C1:1"), "/tmp/project-b")
 
     def test_attach_session_rejects_cross_user_takeover(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -297,6 +363,96 @@ class ConversationExtractionTests(unittest.TestCase):
 
 
 class CodexHelperTests(unittest.TestCase):
+    def test_resolve_reasoning_effort_prefers_thread_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
+            store.set_reasoning_effort("C1:1", "high")
+            store.set(
+                "C1:1",
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                session_origin=server.SESSION_ORIGIN_ATTACHED,
+            )
+
+            effort, source = server.resolve_reasoning_effort(
+                "C1:1",
+                session_id="019d5868-71ba-7101-9143-81867f3db5bf",
+                session_origin=server.SESSION_ORIGIN_ATTACHED,
+                session_store=store,
+            )
+
+        self.assertEqual((effort, source), ("high", "thread"))
+
+    def test_resolve_reasoning_effort_inherits_for_attached_session_without_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
+            store.set(
+                "C1:1",
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                session_origin=server.SESSION_ORIGIN_ATTACHED,
+            )
+            with patch.dict(server.ENV, {"CODEX_REASONING_EFFORT": "high"}, clear=False):
+                effort, source = server.resolve_reasoning_effort(
+                    "C1:1",
+                    session_id="019d5868-71ba-7101-9143-81867f3db5bf",
+                    session_origin=server.SESSION_ORIGIN_ATTACHED,
+                    session_store=store,
+                )
+
+        self.assertEqual((effort, source), (None, "inherited"))
+
+    def test_resolve_reasoning_effort_uses_hard_default_xhigh_for_slack_sessions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
+            with patch.dict(server.ENV, {"CODEX_REASONING_EFFORT": ""}, clear=False):
+                effort, source = server.resolve_reasoning_effort(
+                    "C1:1",
+                    session_id=None,
+                    session_origin=server.SESSION_ORIGIN_SLACK,
+                    session_store=store,
+                )
+
+        self.assertEqual((effort, source), ("xhigh", "default"))
+
+    def test_build_codex_exec_args_adds_reasoning_effort_config(self):
+        with patch.dict(
+            server.ENV,
+            {
+                "CODEX_BIN": "codex",
+                "OPENAI_MODEL": "gpt-5.4",
+                "CODEX_WORKDIR": "/tmp/work",
+                "CODEX_TIMEOUT_SECONDS": "321",
+            },
+            clear=False,
+        ):
+            _codex_bin, args, _timeout, _workdir = server.build_codex_exec_args(
+                "new task",
+                "/tmp/last.txt",
+                reasoning_effort="high",
+            )
+
+        self.assertIn("--config", args)
+        self.assertIn('model_reasoning_effort="high"', args)
+
+    def test_build_codex_resume_args_uses_workdir_override(self):
+        with patch.dict(
+            server.ENV,
+            {
+                "CODEX_BIN": "codex",
+                "OPENAI_MODEL": "gpt-5.4",
+                "CODEX_WORKDIR": "/tmp/default-work",
+                "CODEX_TIMEOUT_SECONDS": "321",
+            },
+            clear=False,
+        ):
+            _codex_bin, _args, _timeout, workdir = server.build_codex_resume_args(
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                "continue",
+                "/tmp/last.txt",
+                workdir_override="/tmp/attached-project",
+            )
+
+        self.assertEqual(workdir, "/tmp/attached-project")
+
     def test_build_codex_resume_args_uses_session_and_prompt(self):
         with patch.dict(
             server.ENV,
@@ -321,6 +477,27 @@ class CodexHelperTests(unittest.TestCase):
         self.assertEqual(args[:4], ["exec", "resume", "--model", "gpt-5.4"])
         self.assertIn("--full-auto", args)
         self.assertEqual(args[-2:], ["019d5868-71ba-7101-9143-81867f3db5bf", "continue"])
+
+    def test_build_codex_resume_args_adds_reasoning_effort_config(self):
+        with patch.dict(
+            server.ENV,
+            {
+                "CODEX_BIN": "codex",
+                "OPENAI_MODEL": "gpt-5.4",
+                "CODEX_WORKDIR": "/tmp/work",
+                "CODEX_TIMEOUT_SECONDS": "321",
+            },
+            clear=False,
+        ):
+            _codex_bin, args, _timeout, _workdir = server.build_codex_resume_args(
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                "continue",
+                "/tmp/last.txt",
+                reasoning_effort="medium",
+            )
+
+        self.assertIn("--config", args)
+        self.assertIn('model_reasoning_effort="medium"', args)
 
     def test_build_codex_child_env_strips_slack_variables(self):
         with patch.dict(os.environ, {"PATH": "/bin", "SLACK_BOT_TOKEN": "from-os"}, clear=True):
@@ -414,9 +591,17 @@ class ProgressExtractionTests(unittest.TestCase):
         discovered_session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
         progress_calls = []
 
-        def fake_run_codex(prompt, session_id=None, session_id_tracker=None):
+        def fake_run_codex(
+            prompt,
+            session_id=None,
+            session_id_tracker=None,
+            reasoning_effort=None,
+            workdir_override=None,
+        ):
             self.assertIsNone(session_id)
             self.assertIsNotNone(session_id_tracker)
+            self.assertIsNone(reasoning_effort)
+            self.assertIsNone(workdir_override)
             session_id_tracker.set(discovered_session_id)
             time.sleep(1.2)
             return server.CodexRunResult(
@@ -494,17 +679,20 @@ class ProcessPromptTests(unittest.TestCase):
             clear=False,
         ):
             with patch.object(server, "stop_watcher", return_value=False):
-                server.process_prompt(
-                    self.client,
-                    self.channel,
-                    self.thread_ts,
-                    f"attach {self.session_id}",
-                    self.user_id,
-                )
+                with patch.object(server, "read_thread_cwd", return_value="/tmp/attached-project"):
+                    server.process_prompt(
+                        self.client,
+                        self.channel,
+                        self.thread_ts,
+                        f"attach {self.session_id}",
+                        self.user_id,
+                    )
 
         self.assertEqual(self.store.get(self.thread_key), self.session_id)
         self.assertEqual(self.store.get_mode(self.thread_key), server.SESSION_MODE_OBSERVE)
+        self.assertEqual(self.store.get_session_cwd(self.thread_key), "/tmp/attached-project")
         self.assertIn("默认已进入 `observe` 模式", self.client.messages[0]["text"])
+        self.assertIn("`/tmp/attached-project`", self.client.messages[0]["text"])
 
     def test_status_reports_watch_state(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
@@ -516,6 +704,153 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertIn("- thread_key: `C1:1`", text)
         self.assertIn(f"- session_id: `{self.session_id}`", text)
         self.assertIn("- watch_active: `yes`", text)
+
+    def test_status_reports_reasoning_effort_state(self):
+        self.store.set_reasoning_effort(self.thread_key, "high", owner_user_id=self.user_id)
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_SLACK,
+            session_cwd="/tmp/project-c",
+        )
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "status", self.user_id)
+
+        text = self.client.messages[0]["text"]
+        self.assertIn("- session_origin: `slack`", text)
+        self.assertIn("- session_cwd: `/tmp/project-c`", text)
+        self.assertIn("- thread_reasoning_effort: `high`", text)
+        self.assertIn("- effective_reasoning_effort: `high (thread)`", text)
+
+    def test_effort_command_sets_thread_override(self):
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_ATTACHED,
+        )
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "effort high", self.user_id)
+
+        self.assertEqual(self.store.get_reasoning_effort(self.thread_key), "high")
+        self.assertIn("已将当前 Slack thread 的 reasoning effort 设为 `high`", self.client.messages[0]["text"])
+
+    def test_effort_reset_on_attached_session_restores_inherited_behavior(self):
+        self.store.set_reasoning_effort(self.thread_key, "medium", owner_user_id=self.user_id)
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_ATTACHED,
+        )
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "effort reset", self.user_id)
+
+        self.assertIsNone(self.store.get_reasoning_effort(self.thread_key))
+        self.assertIn("会继续继承原 session 的 effort 设置", self.client.messages[0]["text"])
+
+    def test_fresh_effort_sets_override_and_uses_it_for_new_slack_session(self):
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="done",
+            exit_code=0,
+            raw_output="",
+            final_output="done",
+            json_output="",
+            cleaned_output="done",
+            timed_out=False,
+        )
+
+        with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+            server.process_prompt(
+                self.client,
+                self.channel,
+                self.thread_ts,
+                "fresh --effort high fix the flaky test",
+                self.user_id,
+            )
+
+        self.assertEqual(self.store.get_reasoning_effort(self.thread_key), "high")
+        self.assertEqual(self.store.get_session_origin(self.thread_key), server.SESSION_ORIGIN_SLACK)
+        self.assertEqual(run_codex_with_updates.call_args.kwargs["reasoning_effort"], "high")
+        self.assertIsNone(run_codex_with_updates.call_args.kwargs["session_id"])
+
+    def test_attached_session_without_override_preserves_inherited_effort(self):
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_ATTACHED,
+            session_cwd="/tmp/original-project",
+        )
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="done",
+            exit_code=0,
+            raw_output="",
+            final_output="done",
+            json_output="",
+            cleaned_output="done",
+            timed_out=False,
+        )
+
+        with patch.dict(server.ENV, {"CODEX_REASONING_EFFORT": "xhigh"}, clear=False):
+            with patch.object(server, "read_thread_cwd", return_value="/tmp/original-project"):
+                with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+                    server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
+
+        self.assertIsNone(run_codex_with_updates.call_args.kwargs["reasoning_effort"])
+        self.assertEqual(run_codex_with_updates.call_args.kwargs["workdir_override"], "/tmp/original-project")
+
+    def test_resume_rebuild_preserves_effort_override_and_switches_origin_to_slack(self):
+        original_result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="session not found",
+            exit_code=1,
+            raw_output="session not found",
+            final_output="",
+            json_output="",
+            cleaned_output="session not found",
+            timed_out=False,
+        )
+        rebuilt_result = server.CodexRunResult(
+            session_id="019d5868-71ba-7101-9143-81867f3db5c0",
+            text="rebuilt",
+            exit_code=0,
+            raw_output="",
+            final_output="rebuilt",
+            json_output="",
+            cleaned_output="rebuilt",
+            timed_out=False,
+        )
+        self.store.set_reasoning_effort(self.thread_key, "high", owner_user_id=self.user_id)
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_ATTACHED,
+            session_cwd="/tmp/original-project",
+        )
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+
+        with patch.object(server, "read_thread_cwd", return_value="/tmp/original-project"):
+            with patch.object(
+                server,
+                "run_codex_with_updates",
+                side_effect=[original_result, rebuilt_result],
+            ) as run_codex_with_updates:
+                server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
+
+        self.assertEqual(run_codex_with_updates.call_args_list[0].kwargs["reasoning_effort"], "high")
+        self.assertEqual(run_codex_with_updates.call_args_list[1].kwargs["reasoning_effort"], "high")
+        self.assertEqual(run_codex_with_updates.call_args_list[0].kwargs["workdir_override"], "/tmp/original-project")
+        self.assertEqual(run_codex_with_updates.call_args_list[1].kwargs["workdir_override"], "/tmp/original-project")
+        self.assertEqual(self.store.get(self.thread_key), "019d5868-71ba-7101-9143-81867f3db5c0")
+        self.assertEqual(self.store.get_reasoning_effort(self.thread_key), "high")
+        self.assertEqual(self.store.get_session_origin(self.thread_key), server.SESSION_ORIGIN_SLACK)
+        self.assertEqual(self.store.get_session_cwd(self.thread_key), "/tmp/original-project")
 
     def test_unwatch_reports_when_watcher_is_stopped(self):
         with patch.object(server, "stop_watcher", return_value=True):
