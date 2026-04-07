@@ -1,5 +1,4 @@
 import atexit
-import asyncio
 import json
 import os
 import queue
@@ -15,22 +14,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import codex_threads as thread_views
+from session_catalog import SessionSelectionCache
+from slack_bolt import App
+from slack_bolt.adapter.socket_mode import SocketModeHandler
+from turn_control import ActiveTurnRegistry
+
 warnings.filterwarnings(
     "ignore",
     message=r'Field ".*" .* protected namespace "model_".*',
     category=UserWarning,
 )
-
-try:
-    from codex_app_server_sdk import CodexClient
-    from codex_app_server_sdk.transport import CodexTransportError, StdioTransport
-except ImportError as exc:  # pragma: no cover
-    raise RuntimeError(
-        "Missing dependency `codex-app-server-sdk`. "
-        "Run `pip install -r requirements.txt` before starting codex-slack."
-    ) from exc
-from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 try:
     import fcntl
@@ -68,6 +62,8 @@ SESSION_LOCKS_GUARD = threading.Lock()
 WATCHERS = {}
 WATCHERS_GUARD = threading.Lock()
 INSTANCE_LOCK_HANDLE = None
+SESSION_SELECTION_CACHE = SessionSelectionCache()
+ACTIVE_TURN_REGISTRY = ActiveTurnRegistry()
 SESSION_MODE_OBSERVE = "observe"
 SESSION_MODE_CONTROL = "control"
 SESSION_ORIGIN_ATTACHED = "attached"
@@ -397,58 +393,12 @@ class WatchHandle:
     thread_ts: str
 
 
-@dataclass(frozen=True)
-class ConversationEvent:
-    turn_id: str
-    item_id: str
-    role: str
-    text: str
-
-
-@dataclass(frozen=True)
-class ProgressEvent:
-    turn_id: str
-    item_id: str
-    phase: str
-    text: str
-
-
-class WatchAnchorLostError(RuntimeError):
-    pass
-
-
-class LargePayloadStdioTransport(StdioTransport):
-    """SDK stdio transport with a larger stdout line limit for huge thread/read payloads."""
-
-    def __init__(self, command, *, cwd=None, env=None, connect_timeout=30.0, line_limit_bytes=None):
-        super().__init__(
-            command,
-            cwd=cwd,
-            env=env,
-            connect_timeout=connect_timeout,
-        )
-        self._line_limit_bytes = int(line_limit_bytes or DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES)
-
-    async def connect(self) -> None:
-        if self._proc is not None:
-            return
-        try:
-            self._proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    *self._command,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    cwd=self._cwd,
-                    env=self._env,
-                    limit=self._line_limit_bytes,
-                ),
-                timeout=self._connect_timeout,
-            )
-        except Exception as exc:  # pragma: no cover
-            raise CodexTransportError(
-                f"failed to start stdio transport command: {self._command!r}"
-            ) from exc
+ConversationEvent = thread_views.ConversationEvent
+ProgressEvent = thread_views.ProgressEvent
+WatchAnchorLostError = thread_views.WatchAnchorLostError
+read_field = thread_views.read_field
+read_root = thread_views.read_root
+truncate_text = thread_views.truncate_text
 
 
 def chunk_text(text, max_length=3500):
@@ -462,27 +412,6 @@ def chunk_text(text, max_length=3500):
         chunks.append(normalized[start : start + max_length])
         start += max_length
     return chunks
-
-
-def read_field(obj, name, default=None):
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
-
-
-def read_root(obj):
-    if isinstance(obj, dict):
-        return obj.get("root", obj)
-    return getattr(obj, "root", obj)
-
-
-def truncate_text(text, max_length=280):
-    normalized = (text or "").strip()
-    if len(normalized) <= max_length:
-        return normalized
-    if max_length <= 15:
-        return normalized[:max_length]
-    return normalized[: max_length - 14].rstrip() + "...<truncated>"
 
 
 def strip_app_mentions(text):
@@ -638,6 +567,17 @@ def get_app_server_stdio_line_limit_bytes():
     return max(1024 * 1024, value)
 
 
+def get_codex_app_server_config():
+    codex_bin, _model, workdir, _timeout, _sandbox, _extra_args, _full_auto = get_codex_settings()
+    return thread_views.CodexAppServerConfig(
+        codex_bin=codex_bin,
+        workdir=workdir,
+        env=build_codex_child_env(),
+        line_limit_bytes=get_app_server_stdio_line_limit_bytes(),
+        max_retries=MAX_APP_SERVER_RETRIES,
+    )
+
+
 def get_watch_poll_seconds():
     raw = str(ENV.get("CODEX_SLACK_WATCH_POLL_SECONDS", DEFAULT_WATCH_POLL_SECONDS)).strip()
     try:
@@ -750,8 +690,7 @@ def get_session_cwd(thread_key, session_store=None):
 
 
 def extract_thread_cwd(thread_read_response):
-    thread = read_field(thread_read_response, "thread", thread_read_response)
-    return normalize_session_cwd(read_field(thread, "cwd"))
+    return thread_views.extract_thread_cwd(thread_read_response)
 
 
 def read_thread_cwd(session_id):
@@ -1377,127 +1316,39 @@ def session_execution_guard(session_id):
 
 
 def create_app_server_client():
-    codex_bin, _model, workdir, _timeout, _sandbox, _extra_args, _full_auto = get_codex_settings()
-    transport = LargePayloadStdioTransport(
-        [codex_bin, "app-server"],
-        cwd=workdir,
-        env=build_codex_child_env(),
-        line_limit_bytes=get_app_server_stdio_line_limit_bytes(),
-    )
-    return CodexClient(transport)
+    return thread_views.create_app_server_client(get_codex_app_server_config())
 
 
 async def read_thread_response_async(session_id):
-    client = create_app_server_client()
-    await client.start()
-    await client.initialize()
-    try:
-        return await client.read_thread(session_id, include_turns=True)
-    finally:
-        with suppress(Exception):
-            await client.close()
+    return await thread_views.read_thread_response_async(get_codex_app_server_config(), session_id)
 
 
 def read_thread_response(session_id):
-    last_error = None
-    for _attempt in range(MAX_APP_SERVER_RETRIES):
-        try:
-            return asyncio.run(read_thread_response_async(session_id))
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"读取 thread 对话失败: {last_error}")
+    return thread_views.read_thread_response(get_codex_app_server_config(), session_id)
 
 
 def format_user_input(user_input):
-    root = read_root(user_input)
-    input_type = read_field(root, "type")
-    if input_type == "text":
-        return (read_field(root, "text", "") or "").strip()
-    if input_type == "image":
-        return "[image]"
-    if input_type == "localImage":
-        return f"[local image: {read_field(root, 'path', '-') or '-'}]"
-    if input_type == "skill":
-        return f"[skill: {read_field(root, 'name', '-') or '-'}]"
-    if input_type == "mention":
-        return f"[mention: {read_field(root, 'name', '-') or '-'}]"
-    return ""
+    return thread_views.format_user_input(user_input)
 
 
 def format_user_message_content(content_items):
-    parts = []
-    for item in content_items or []:
-        part = format_user_input(item)
-        if part:
-            parts.append(part)
-    return "\n".join(parts).strip()
+    return thread_views.format_user_message_content(content_items)
 
 
 def is_final_answer_phase(phase):
-    return phase == "final_answer"
+    return thread_views.is_final_answer_phase(phase)
 
 
 def is_progress_phase(phase):
-    return bool(phase) and phase != "final_answer"
+    return thread_views.is_progress_phase(phase)
 
 
 def extract_conversation_events(thread_read_response):
-    thread = read_field(thread_read_response, "thread", thread_read_response)
-    events = []
-    fallback_index = 0
-
-    for turn in read_field(thread, "turns", []) or []:
-        turn_id = read_field(turn, "id") or f"turn-{fallback_index}"
-        for item in read_field(turn, "items", []) or []:
-            root = read_root(item)
-            item_type = read_field(root, "type")
-            item_id = read_field(root, "id") or f"{turn_id}:item-{fallback_index}"
-            fallback_index += 1
-
-            if item_type == "userMessage":
-                text = format_user_message_content(read_field(root, "content", []) or [])
-                if text:
-                    events.append(ConversationEvent(turn_id=turn_id, item_id=item_id, role="user", text=text))
-                continue
-
-            if item_type != "agentMessage":
-                continue
-
-            if not is_final_answer_phase(read_field(root, "phase")):
-                continue
-
-            text = (read_field(root, "text", "") or "").strip()
-            if text:
-                events.append(ConversationEvent(turn_id=turn_id, item_id=item_id, role="assistant", text=text))
-
-    return events
+    return thread_views.extract_conversation_events(thread_read_response)
 
 
 def extract_progress_events(thread_read_response):
-    thread = read_field(thread_read_response, "thread", thread_read_response)
-    events = []
-    fallback_index = 0
-
-    for turn in read_field(thread, "turns", []) or []:
-        turn_id = read_field(turn, "id") or f"turn-{fallback_index}"
-        for item in read_field(turn, "items", []) or []:
-            root = read_root(item)
-            item_type = read_field(root, "type")
-            item_id = read_field(root, "id") or f"{turn_id}:progress-{fallback_index}"
-            fallback_index += 1
-
-            if item_type != "agentMessage":
-                continue
-
-            phase = read_field(root, "phase")
-            if not is_progress_phase(phase):
-                continue
-
-            text = (read_field(root, "text", "") or "").strip()
-            if text:
-                events.append(ProgressEvent(turn_id=turn_id, item_id=item_id, phase=phase, text=text))
-
-    return events
+    return thread_views.extract_progress_events(thread_read_response)
 
 
 def read_conversation_events(session_id):
@@ -1505,68 +1356,23 @@ def read_conversation_events(session_id):
 
 
 def get_event_key(event):
-    return (event.turn_id, event.item_id)
+    return thread_views.get_event_key(event)
 
 
 def get_recent_turn_events(events):
-    if not events:
-        return []
-    last_turn_id = events[-1].turn_id
-    return [event for event in events if event.turn_id == last_turn_id]
+    return thread_views.get_recent_turn_events(events)
 
 
 def get_latest_completed_turn_events(events):
-    if not events:
-        return []
-
-    grouped_turns = []
-    current_turn_id = None
-    current_events = []
-    for event in events:
-        if event.turn_id != current_turn_id:
-            if current_events:
-                grouped_turns.append(current_events)
-            current_turn_id = event.turn_id
-            current_events = [event]
-        else:
-            current_events.append(event)
-    if current_events:
-        grouped_turns.append(current_events)
-
-    for turn_events in reversed(grouped_turns):
-        if any(event.role == "assistant" for event in turn_events):
-            return turn_events
-    return []
+    return thread_views.get_latest_completed_turn_events(events)
 
 
 def get_events_after_key(events, last_key):
-    if last_key is None:
-        return list(events)
-
-    for index, event in enumerate(events):
-        if get_event_key(event) == last_key:
-            return events[index + 1 :]
-
-    raise WatchAnchorLostError(f"watch anchor {last_key!r} is no longer present in the current thread view")
+    return thread_views.get_events_after_key(events, last_key)
 
 
 def format_conversation_events(events, heading=None):
-    if not events:
-        return "当前 thread 还没有可显示的对话内容。"
-
-    blocks = []
-    if heading:
-        blocks.append(heading)
-
-    for event in events:
-        label = "User" if event.role == "user" else "Codex"
-        quoted_text = "\n".join(
-            f"> {line}" if line else ">"
-            for line in (event.text or "").splitlines()
-        ).strip()
-        blocks.append(f"*{label}*\n{quoted_text}")
-
-    return "\n\n".join(blocks).strip()
+    return thread_views.format_conversation_events(events, heading=heading)
 
 
 def build_watch_bootstrap(session_id):
@@ -1585,36 +1391,11 @@ def capture_progress_baseline(session_id):
 
 
 def format_progress_message(text):
-    quoted_text = "\n".join(
-        f"> {line}" if line else ">"
-        for line in (text or "").splitlines()
-    ).strip()
-    return f"*Codex Progress*\n{quoted_text}"
+    return thread_views.format_progress_message(text)
 
 
 def build_progress_messages(progress_events, previous_text_by_item_id):
-    messages = []
-
-    for event in progress_events:
-        previous_text = previous_text_by_item_id.get(event.item_id)
-        current_text = event.text
-        if previous_text == current_text:
-            continue
-
-        display_text = current_text
-        if previous_text and current_text.startswith(previous_text):
-            delta_text = current_text[len(previous_text) :].strip()
-            if not delta_text:
-                previous_text_by_item_id[event.item_id] = current_text
-                continue
-            display_text = delta_text
-        else:
-            display_text = truncate_text(current_text, max_length=1200)
-
-        previous_text_by_item_id[event.item_id] = current_text
-        messages.append(format_progress_message(display_text))
-
-    return messages
+    return thread_views.build_progress_messages(progress_events, previous_text_by_item_id)
 
 
 def maybe_post_progress_updates(client, channel, thread_ts, session_id, previous_text_by_item_id):
