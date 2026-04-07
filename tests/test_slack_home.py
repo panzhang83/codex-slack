@@ -130,6 +130,70 @@ class SlackHomeViewTests(unittest.TestCase):
         )
         self.assertIn("Use takeover when you need write access.", context_text)
 
+    def test_build_home_view_collapses_multiline_binding_labels(self):
+        view = slack_home.build_home_view(
+            default_workdir="/tmp/project",
+            default_model="gpt-5.4",
+            default_effort="xhigh",
+            bindings_summary="ignored",
+            recent_sessions_summary="ignored",
+            bindings_rows=[
+                {
+                    "label": "Three-body analyticity\n/Users/fkg/Coding/Agents/ThreeBody_Analytic",
+                    "session_id": "sess-1",
+                    "mode": "control",
+                    "cwd": "/tmp/project",
+                    "updated_at": "2026-04-07 16:12:42",
+                    "status_text": "Direct\nMessage",
+                    "action_id": "binding_rename_open",
+                    "action_text": "Rename",
+                    "action_value": "{\"thread_key\":\"D1:1\",\"session_id\":\"sess-1\"}",
+                }
+            ],
+            recent_sessions_rows=[],
+        )
+        section_texts = [
+            block.get("text", {}).get("text", "")
+            for block in view["blocks"]
+            if block.get("type") == "section"
+        ]
+        joined = "\n".join(section_texts)
+        self.assertIn("*1. Three-body analyticity /Users/fkg/Coding/Agents/ThreeBody＿Analytic*", joined)
+        self.assertIn("_Direct Message_", joined)
+
+    def test_build_home_view_sanitizes_mrkdwn_control_characters_in_labels(self):
+        view = slack_home.build_home_view(
+            default_workdir="/tmp/project",
+            default_model="gpt-5.4",
+            default_effort="xhigh",
+            bindings_summary="ignored",
+            recent_sessions_summary="ignored",
+            bindings_rows=[
+                {
+                    "label": "alpha *beta* _gamma_ `delta` <tag>",
+                    "session_id": "sess`-1",
+                    "mode": "con<trol>",
+                    "cwd": "/tmp/<project>`",
+                    "updated_at": "2026-04-07 16:12:42",
+                    "status_text": "Direct _Message_",
+                    "action_id": "binding_rename_open",
+                    "action_text": "Rename",
+                    "action_value": "{\"thread_key\":\"D1:1\",\"session_id\":\"sess-1\"}",
+                }
+            ],
+            recent_sessions_rows=[],
+        )
+        section_texts = [
+            block.get("text", {}).get("text", "")
+            for block in view["blocks"]
+            if block.get("type") == "section"
+        ]
+        joined = "\n".join(section_texts)
+        self.assertIn("*1. alpha ∗beta∗ ＿gamma＿ ˋdeltaˋ &lt;tag&gt;*", joined)
+        self.assertIn("`sessˋ-1` | mode=`con&lt;trol&gt;`", joined)
+        self.assertIn("cwd=`/tmp/&lt;project&gt;ˋ`", joined)
+        self.assertIn("_Direct ＿Message＿_", joined)
+
     def test_build_home_view_renders_clean_empty_states_for_rich_rows(self):
         view = slack_home.build_home_view(
             default_workdir="/tmp/project",

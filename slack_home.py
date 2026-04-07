@@ -1,5 +1,26 @@
 from typing import Mapping, Optional, Sequence
 
+MRKDWN_TEXT_REPLACEMENTS = str.maketrans(
+    {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "*": "∗",
+        "_": "＿",
+        "~": "∼",
+        "`": "ˋ",
+    }
+)
+
+MRKDWN_CODE_REPLACEMENTS = str.maketrans(
+    {
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "`": "ˋ",
+    }
+)
+
 
 def _as_text(value, default="-"):
     normalized = str(value or "").strip()
@@ -9,6 +30,21 @@ def _as_text(value, default="-"):
 def _as_optional_text(value):
     normalized = str(value or "").strip()
     return normalized or None
+
+
+def _as_inline_text(value, default="-"):
+    normalized = _as_optional_text(value)
+    if not normalized:
+        return default
+    return " ".join(normalized.split())
+
+
+def _escape_mrkdwn_text(value, default="-"):
+    return _as_inline_text(value, default=default).translate(MRKDWN_TEXT_REPLACEMENTS)
+
+
+def _escape_mrkdwn_code(value, default="-"):
+    return _as_text(value, default=default).translate(MRKDWN_CODE_REPLACEMENTS)
 
 
 def _as_rows(rows):
@@ -22,12 +58,12 @@ def _as_rows(rows):
 
 
 def _binding_row_text(row, index):
-    label = _as_text(row.get("label"), default=f"Binding {index}")
-    session_id = _as_text(row.get("session_id"))
-    mode = _as_text(row.get("mode"))
-    cwd = _as_text(row.get("cwd"))
-    updated_at = _as_text(row.get("updated_at"))
-    status_text = _as_optional_text(row.get("status_text"))
+    label = _escape_mrkdwn_text(row.get("label"), default=f"Binding {index}")
+    session_id = _escape_mrkdwn_code(row.get("session_id"))
+    mode = _escape_mrkdwn_code(row.get("mode"))
+    cwd = _escape_mrkdwn_code(row.get("cwd"))
+    updated_at = _escape_mrkdwn_code(row.get("updated_at"))
+    status_text = _escape_mrkdwn_text(row.get("status_text"), default="")
     lines = [
         f"*{index}. {label}*",
         f"`{session_id}` | mode=`{mode}`",
@@ -39,12 +75,12 @@ def _binding_row_text(row, index):
 
 
 def _recent_row_text(row, index):
-    label = _as_text(row.get("label"), default=f"Session {index}")
-    thread_id = _as_text(row.get("thread_id"))
-    title = _as_text(row.get("title"), default="(untitled)")
-    cwd = _as_text(row.get("cwd"))
-    status = _as_text(row.get("status"))
-    status_text = _as_optional_text(row.get("status_text"))
+    label = _escape_mrkdwn_text(row.get("label"), default=f"Session {index}")
+    thread_id = _escape_mrkdwn_code(row.get("thread_id"))
+    title = _escape_mrkdwn_text(row.get("title"), default="(untitled)")
+    cwd = _escape_mrkdwn_code(row.get("cwd"))
+    status = _escape_mrkdwn_code(row.get("status"))
+    status_text = _escape_mrkdwn_text(row.get("status_text"), default="")
     lines = [
         f"*{index}. {label}*",
         f"`{thread_id}` | {title}",
