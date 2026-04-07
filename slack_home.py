@@ -1,6 +1,32 @@
 from typing import Optional
 
 
+def format_binding_summary_rows(rows):
+    if not rows:
+        return "_No bindings yet._\nUse `fresh ...` or `attach <session_id>` in a Slack thread."
+
+    lines = []
+    for index, row in enumerate(rows, start=1):
+        lines.append(
+            f"{index}. `{row.get('session_id', '-')}` | mode=`{row.get('mode', '-')}` | "
+            f"cwd=`{row.get('cwd', '-')}` | updated=`{row.get('updated_at', '-')}`"
+        )
+    return "\n".join(lines)
+
+
+def format_recent_sessions_rows(rows):
+    if not rows:
+        return "_No recent sessions found._\nStart one with `fresh ...` in DM or `@bot ...` in a channel."
+
+    lines = []
+    for index, row in enumerate(rows, start=1):
+        lines.append(
+            f"{index}. `{row.get('thread_id', '-')}` | {row.get('title', '(untitled)')} | "
+            f"cwd=`{row.get('cwd', '-')}` | status=`{row.get('status', '-')}`"
+        )
+    return "\n".join(lines)
+
+
 def build_home_view(
     *,
     default_workdir: str,

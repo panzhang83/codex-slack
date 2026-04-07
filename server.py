@@ -16,6 +16,7 @@ from typing import Optional
 
 import codex_threads as thread_views
 import session_catalog
+import slack_home
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from turn_control import ActiveTurnRegistry, interrupt_active_turn, steer_active_turn
@@ -373,6 +374,30 @@ class SlackThreadSessionStore:
                 return
             entry["updated_at"] = int(time.time())
             self._save_locked()
+
+    def list_for_owner(self, owner_user_id, limit=5):
+        with self._lock:
+            rows = []
+            for thread_key, entry in self._sessions.items():
+                if entry.get("owner_user_id") != owner_user_id:
+                    continue
+                session_id = entry.get("session_id")
+                if not session_id:
+                    continue
+                rows.append(
+                    {
+                        "thread_key": thread_key,
+                        "session_id": session_id,
+                        "mode": entry.get("mode") or SESSION_MODE_CONTROL,
+                        "cwd": entry.get("session_cwd") or "-",
+                        "updated_at": int(entry.get("updated_at") or 0),
+                    }
+                )
+
+            rows.sort(key=lambda row: row["updated_at"], reverse=True)
+            if limit and limit > 0:
+                rows = rows[:limit]
+            return rows
 
 
 SESSION_STORE = SlackThreadSessionStore(SESSION_STORE_PATH)
@@ -2499,6 +2524,85 @@ def validate_env():
         raise RuntimeError(f"Missing required environment variables: {joined}")
 
 
+def format_home_timestamp(unix_ts):
+    if not unix_ts:
+        return "-"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(unix_ts)))
+    except Exception:
+        return "-"
+
+
+def get_home_bindings_rows(user_id, limit=5):
+    raw_rows = SESSION_STORE.list_for_owner(user_id, limit=limit)
+    rows = []
+    for row in raw_rows:
+        rows.append(
+            {
+                "session_id": row.get("session_id", "-"),
+                "mode": row.get("mode", "-"),
+                "cwd": row.get("cwd", "-"),
+                "updated_at": format_home_timestamp(row.get("updated_at")),
+            }
+        )
+    return rows
+
+
+def get_home_recent_sessions_rows(limit=5):
+    try:
+        response = thread_views.list_threads(
+            get_codex_app_server_config(),
+            archived=False,
+            limit=limit,
+            sort_key="updated_at",
+            sort_direction="desc",
+        )
+        summaries = thread_views.extract_thread_summaries(response)
+    except Exception as exc:
+        return [
+            {
+                "thread_id": "-",
+                "title": f"[unavailable] {truncate_text(str(exc), max_length=120)}",
+                "cwd": "-",
+                "status": "-",
+            }
+        ]
+
+    rows = []
+    for summary in summaries[:limit]:
+        rows.append(
+            {
+                "thread_id": summary.thread_id or "-",
+                "title": summary.name or summary.preview or "(untitled)",
+                "cwd": summary.cwd or "-",
+                "status": summary.status_type or "-",
+            }
+        )
+    return rows
+
+
+def publish_home_view(client, user_id):
+    codex_bin, model, default_workdir, timeout, sandbox, _extra_args, full_auto = get_codex_settings()
+    bindings_summary = slack_home.format_binding_summary_rows(get_home_bindings_rows(user_id, limit=5))
+    recent_sessions_summary = slack_home.format_recent_sessions_rows(get_home_recent_sessions_rows(limit=5))
+    help_text = (
+        "Use `refresh` in Home, or continue controlling sessions in thread with "
+        "`attach`, `watch`, `control/takeover`, `observe`, and `status`."
+    )
+    view = slack_home.build_home_view(
+        default_workdir=default_workdir,
+        default_model=model,
+        default_effort=get_default_reasoning_effort(),
+        bindings_summary=bindings_summary,
+        recent_sessions_summary=recent_sessions_summary,
+        help_text=(
+            f"{help_text}\nConfig: sandbox=`{sandbox}` timeout=`{timeout}` "
+            f"full_auto=`{'1' if full_auto else '0'}` codex_bin=`{codex_bin}`"
+        ),
+    )
+    client.views_publish(user_id=user_id, view=view)
+
+
 def build_app():
     app = App(
         token=ENV["SLACK_BOT_TOKEN"],
@@ -2519,6 +2623,35 @@ def build_app():
             flush=True,
         )
         next()
+
+    @app.event("app_home_opened")
+    def handle_app_home_opened(body, client, logger):
+        event = body.get("event", {})
+        user_id = event.get("user", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected app_home_opened from unauthorized user %s", user_id)
+            return
+        try:
+            publish_home_view(client, user_id)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed publishing App Home for %s: %r", user_id, exc)
+
+    @app.action("home_refresh")
+    def handle_home_refresh(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected home_refresh from unauthorized user %s", user_id)
+            return
+        try:
+            publish_home_view(client, user_id)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed refreshing App Home for %s: %r", user_id, exc)
 
     @app.event("app_mention")
     def handle_app_mention(body, client, logger):
