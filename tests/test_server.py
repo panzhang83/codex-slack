@@ -51,6 +51,7 @@ class DummyClient:
 
     def chat_postMessage(self, **kwargs):
         self.messages.append(kwargs)
+        return {"ok": True, "ts": str(len(self.messages))}
 
 
 class CommandParsingTests(unittest.TestCase):
@@ -608,11 +609,13 @@ class ProgressExtractionTests(unittest.TestCase):
             session_id_tracker=None,
             reasoning_effort=None,
             workdir_override=None,
+            image_paths=None,
         ):
             self.assertIsNone(session_id)
             self.assertIsNotNone(session_id_tracker)
             self.assertIsNone(reasoning_effort)
             self.assertIsNone(workdir_override)
+            self.assertIsNone(image_paths)
             session_id_tracker.set(discovered_session_id)
             time.sleep(1.2)
             return server.CodexRunResult(
@@ -782,6 +785,101 @@ class ProcessPromptTests(unittest.TestCase):
             "triage flaky test",
         )
         self.assertIn("已将当前 session 重命名为 `triage flaky test`", self.client.messages[0]["text"])
+
+    def test_image_only_message_uses_default_prompt_and_image_paths(self):
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="done",
+            exit_code=0,
+            raw_output="",
+            final_output="done",
+            json_output="",
+            cleaned_output="done",
+            timed_out=False,
+        )
+        image_download = server.slack_image_inputs.SlackImageDownload(
+            file_id="F1",
+            filename="cat.png",
+            download_url="https://files.slack.com/cat.png",
+            mimetype="image/png",
+        )
+        image_path = Path("/tmp/cat.png")
+
+        with patch.object(server.slack_image_inputs, "build_image_downloads_from_event", return_value=[image_download]):
+            with patch.object(server.slack_image_inputs, "download_slack_image_files", return_value=[image_path]):
+                with patch.object(server.slack_image_inputs, "cleanup_downloaded_files") as cleanup_downloaded_files:
+                    with patch.object(server.slack_image_inputs, "cleanup_download_directory") as cleanup_download_directory:
+                        with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+                            server.process_prompt(
+                                self.client,
+                                self.channel,
+                                self.thread_ts,
+                                "",
+                                self.user_id,
+                                slack_event_payload={"event": {"files": [{"id": "F1"}]}},
+                            )
+
+        self.assertEqual(run_codex_with_updates.call_args.kwargs["image_paths"], [image_path])
+        self.assertEqual(run_codex_with_updates.call_args.args[3], server.DEFAULT_IMAGE_ONLY_PROMPT)
+        cleanup_downloaded_files.assert_called_once_with([image_path])
+        cleanup_download_directory.assert_called_once()
+
+    def test_image_download_failure_returns_user_facing_error(self):
+        image_download = server.slack_image_inputs.SlackImageDownload(
+            file_id="F1",
+            filename="cat.png",
+            download_url="https://files.slack.com/cat.png",
+            mimetype="image/png",
+        )
+
+        with patch.object(server.slack_image_inputs, "build_image_downloads_from_event", return_value=[image_download]):
+            with patch.object(server.slack_image_inputs, "download_slack_image_files", side_effect=RuntimeError("boom")):
+                with patch.object(server, "run_codex_with_updates") as run_codex_with_updates:
+                    server.process_prompt(
+                        self.client,
+                        self.channel,
+                        self.thread_ts,
+                        "",
+                        self.user_id,
+                        slack_event_payload={"event": {"files": [{"id": "F1"}]}},
+                    )
+
+        run_codex_with_updates.assert_not_called()
+        self.assertIn("下载 Slack 图片失败", self.client.messages[-1]["text"])
+
+    def test_get_home_bindings_rows_prefers_session_title_and_rename_action(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id, session_cwd="/tmp/project")
+        with patch.object(server, "read_thread_response", return_value={"thread": {"name": "mobile handoff"}}):
+            rows = server.get_home_bindings_rows(self.user_id, limit=5)
+
+        self.assertEqual(rows[0]["label"], "mobile handoff")
+        self.assertEqual(rows[0]["status_text"], "Channel Thread")
+        self.assertEqual(rows[0]["action_id"], "binding_rename_open")
+        self.assertEqual(rows[0]["action_text"], "Rename")
+
+    def test_get_home_bindings_rows_falls_back_to_binding_label_when_thread_title_unavailable(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id, session_cwd="/tmp/project")
+
+        with patch.object(server, "read_thread_response", side_effect=RuntimeError("boom")):
+            rows = server.get_home_bindings_rows(self.user_id, limit=5)
+
+        self.assertEqual(rows[0]["label"], "Channel Thread")
+        self.assertIsNone(rows[0]["status_text"])
+
+    def test_build_home_rename_modal_encodes_binding_metadata(self):
+        modal = server.build_home_rename_modal(
+            thread_key=self.thread_key,
+            session_id=self.session_id,
+            initial_title="triage flaky test",
+        )
+
+        self.assertEqual(modal["callback_id"], "binding_rename_submit")
+        self.assertEqual(
+            server.decode_home_binding_value(modal["private_metadata"]),
+            (self.thread_key, self.session_id),
+        )
+        input_element = modal["blocks"][0]["element"]
+        self.assertEqual(input_element["initial_value"], "triage flaky test")
 
     def test_status_reports_watch_state(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)

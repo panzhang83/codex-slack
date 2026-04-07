@@ -16,11 +16,13 @@
 - `recent` / `sessions` 可查看最近的 Codex sessions，并支持 `attach recent <n>`
 - `attach` 后默认进入 `observe` 模式，避免和终端里的交互式 Codex 并发写入
 - 只有切到 `control` / `takeover` 模式后，Slack 普通消息才会继续 `resume` 当前 session
+- 支持把 Slack 消息里的图片附件传给 Codex，作为 `--image` 输入
 - `watch` 会先回放最近一轮已完成的可显示对话，然后持续推送后续新增的用户消息和 `final_answer`
 - `name <title>` 可重命名当前 session
 - `interrupt` / `steer <text>` 可控制当前活跃 turn
 - 支持按 Slack thread 设置 reasoning effort：`effort <level>`、`effort reset`、`fresh --effort <level> ...`
 - App Home 会显示默认配置、你自己的 Slack thread 绑定和最近 sessions
+- App Home 里的 binding 行支持 `Rename`，可直接改当前绑定 session 的标题
 - 支持白名单 `ALLOWED_SLACK_USER_IDS`
 - 同一个 session 会按 `session_id` 串行执行，避免多个 Slack thread 并发 `resume`
 
@@ -127,9 +129,10 @@ python3 server.py
 
 - `chat:write`
 - `im:history`
+- `files:read`
 - `app_mentions:read`
 
-如果你只打算私聊控制，`chat:write` 和 `im:history` 是最低必需项；如果要在频道里 `@bot`，则还需要 `app_mentions:read`。
+如果你只打算私聊控制，`chat:write` 和 `im:history` 是最低必需项；如果要把 Slack 图片附件传给 Codex，则还需要 `files:read`；如果要在频道里 `@bot`，则还需要 `app_mentions:read`。
 
 4. 配置 Event Subscriptions
 
@@ -257,7 +260,9 @@ watch
 - `sessions --all` 会忽略工作目录过滤，显示全局最近 sessions
 - `sessions --cwd /path/to/project` 会按你给定的目录过滤
 - 列表里的序号只在当前 Slack thread 内暂存一段时间，所以如果你想用 `attach recent <n>`，最好紧接着在同一个 Slack thread 里发送
-- App Home 是一个只读仪表板，方便你快速看到默认 model / effort / workdir、你自己的 Slack thread 绑定，以及最近 sessions
+- App Home 是一个操作面板，方便你快速看到默认 model / effort / workdir、你自己的 Slack thread 绑定，以及最近 sessions
+- App Home 里的 binding 会优先显示 session 当前标题；如果还没有显式标题，则退回显示 Slack thread 类型
+- 你可以直接在 App Home 点击 `Rename`，用 Slack modal 给这个绑定的 session 改名
 - App Home 不会替代 Slack thread 控制；真正的 `attach`、`watch`、`takeover`、`steer` 仍然在消息 thread 里完成
 
 ## `interrupt` 和 `steer`
@@ -267,6 +272,15 @@ watch
 - `steer <text>` 会向当前活跃 turn 追加一条指令
 - `steer` 只在 `control` 模式下可用，避免你在只读镜像模式里意外写入
 - 这两个命令都依赖当前 session 里确实存在活跃 turn；如果当前没有正在运行的 turn，Slack 会直接返回错误说明
+
+## 图片附件
+
+- 如果你在私聊或 `@bot` thread 里发送图片附件，服务会把图片下载到本地临时目录，并通过 Codex CLI 的 `--image` 传给模型
+- 如果消息里既有文字也有图片，文字会作为正常 prompt，图片会作为附加输入
+- 如果你只发图片不写文字，服务会自动补一条默认提示，让 Codex 先基于图片继续处理
+- 图片下载完成后会在本轮结束后自动清理临时文件
+- 目前只转发图片类附件；普通非图片文件不会自动传给 Codex
+- 这项能力依赖 Slack scope `files:read`
 
 ## 白名单和 User ID
 
@@ -296,8 +310,8 @@ watch
 运行语法检查和测试：
 
 ```bash
-python3 -m py_compile server.py codex_threads.py session_catalog.py turn_control.py slack_home.py tests/test_server.py tests/test_session_catalog.py tests/test_turn_control.py tests/test_slack_home.py
-python3 -m unittest -q tests.test_server tests.test_session_catalog tests.test_turn_control tests.test_slack_home
+python3 -m py_compile server.py codex_threads.py session_catalog.py turn_control.py slack_home.py slack_image_inputs.py tests/test_server.py tests/test_session_catalog.py tests/test_turn_control.py tests/test_slack_home.py tests/test_slack_image_inputs.py
+python3 -m unittest -q tests.test_server tests.test_session_catalog tests.test_turn_control tests.test_slack_home tests.test_slack_image_inputs
 ```
 
 ## 文件说明
@@ -307,9 +321,11 @@ python3 -m unittest -q tests.test_server tests.test_session_catalog tests.test_t
 - `session_catalog.py`：recent / sessions 列表和 `attach recent <n>` 选择缓存
 - `turn_control.py`：活跃 turn 检测、`interrupt` 和 `steer`
 - `slack_home.py`：App Home 仪表板视图
+- `slack_image_inputs.py`：Slack 图片附件提取、下载和清理
 - `tests/test_server.py`：主流程和命令路由测试
 - `tests/test_session_catalog.py`：recent / sessions 列表测试
 - `tests/test_turn_control.py`：turn 控制测试
 - `tests/test_slack_home.py`：App Home 视图测试
+- `tests/test_slack_image_inputs.py`：Slack 图片输入测试
 - `.env.example`：环境变量模板
 - `requirements.txt`：Python 依赖

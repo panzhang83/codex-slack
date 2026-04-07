@@ -17,6 +17,7 @@ from typing import Optional
 import codex_threads as thread_views
 import session_catalog
 import slack_home
+import slack_image_inputs
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from turn_control import ActiveTurnRegistry, interrupt_active_turn, steer_active_turn
@@ -77,12 +78,25 @@ DEFAULT_PROGRESS_POLL_SECONDS = 15
 MAX_APP_SERVER_RETRIES = 2
 MAX_WATCH_READ_FAILURES = 2
 DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES = 32 * 1024 * 1024
+DEFAULT_IMAGE_ONLY_PROMPT = "请查看我附上的图片，并按我的上下文继续处理。"
+DEFAULT_PROGRESS_UPDATES_ENABLED = True
 
 
 def normalize_reasoning_effort(value):
     normalized = str(value or "").strip().lower()
     if normalized in SUPPORTED_REASONING_EFFORTS:
         return normalized
+    return None
+
+
+def normalize_progress_updates(value):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"on", "true", "1", "yes"}:
+        return True
+    if normalized in {"off", "false", "0", "no"}:
+        return False
     return None
 
 
@@ -821,6 +835,16 @@ def build_reasoning_effort_args(reasoning_effort):
     return ["--config", f'model_reasoning_effort="{normalized}"']
 
 
+def build_image_args(image_paths):
+    args = []
+    for raw_path in image_paths or []:
+        path = str(raw_path or "").strip()
+        if not path:
+            continue
+        args.extend(["--image", path])
+    return args
+
+
 def get_observe_mode_error(user_id, session_id):
     return (
         f"<@{user_id}> 当前 Slack thread 绑定的 session `{session_id or '-'}` 处于 `observe` 模式。"
@@ -880,7 +904,14 @@ def get_reasoning_effort_reset_message(thread_key, session_id=None, session_orig
     )
 
 
-def build_codex_exec_args(prompt, output_file, extra_cli_args=None, reasoning_effort=None, workdir_override=None):
+def build_codex_exec_args(
+    prompt,
+    output_file,
+    extra_cli_args=None,
+    reasoning_effort=None,
+    workdir_override=None,
+    image_paths=None,
+):
     codex_bin, model, default_workdir, timeout, sandbox, extra_args, full_auto = get_codex_settings()
     workdir = normalize_session_cwd(workdir_override) or default_workdir
     args = [
@@ -907,6 +938,7 @@ def build_codex_exec_args(prompt, output_file, extra_cli_args=None, reasoning_ef
     if extra_cli_args:
         args.extend(extra_cli_args)
 
+    args.extend(build_image_args(image_paths))
     args.extend(build_reasoning_effort_args(reasoning_effort))
     args.append(prompt)
     return codex_bin, args, timeout, workdir
@@ -919,6 +951,7 @@ def build_codex_resume_args(
     extra_cli_args=None,
     reasoning_effort=None,
     workdir_override=None,
+    image_paths=None,
 ):
     codex_bin, model, default_workdir, timeout, _sandbox, extra_args, full_auto = get_codex_settings()
     workdir = normalize_session_cwd(workdir_override) or default_workdir
@@ -938,6 +971,7 @@ def build_codex_resume_args(
         args.extend(shlex.split(extra_args))
     if extra_cli_args:
         args.extend(extra_cli_args)
+    args.extend(build_image_args(image_paths))
     args.extend(build_reasoning_effort_args(reasoning_effort))
     args.extend([session_id, prompt])
     return codex_bin, args, timeout, workdir
@@ -1224,7 +1258,14 @@ def stream_codex_json_output(process, timeout, session_id_tracker=None):
     return "".join(raw_lines), parsed_session_id, json_output, timed_out
 
 
-def run_codex(prompt, session_id=None, session_id_tracker=None, reasoning_effort=None, workdir_override=None):
+def run_codex(
+    prompt,
+    session_id=None,
+    session_id_tracker=None,
+    reasoning_effort=None,
+    workdir_override=None,
+    image_paths=None,
+):
     with tempfile.NamedTemporaryFile(prefix="codex-last-message-", suffix=".txt", delete=False) as tmp:
         output_file = tmp.name
 
@@ -1237,6 +1278,7 @@ def run_codex(prompt, session_id=None, session_id_tracker=None, reasoning_effort
                 output_file,
                 reasoning_effort=reasoning_effort,
                 workdir_override=workdir_override,
+                image_paths=image_paths,
             )
             log_codex_command(mode, workdir, [codex_bin, *args])
         else:
@@ -1245,6 +1287,7 @@ def run_codex(prompt, session_id=None, session_id_tracker=None, reasoning_effort
                 output_file,
                 reasoning_effort=reasoning_effort,
                 workdir_override=workdir_override,
+                image_paths=image_paths,
             )
             log_codex_command(mode, workdir, [codex_bin, *args])
 
@@ -1515,6 +1558,7 @@ def run_codex_with_updates(
     enable_progress=False,
     reasoning_effort=None,
     workdir_override=None,
+    image_paths=None,
 ):
     result_box = {}
     error_box = {}
@@ -1528,6 +1572,7 @@ def run_codex_with_updates(
                 session_id_tracker=session_id_tracker,
                 reasoning_effort=reasoning_effort,
                 workdir_override=workdir_override,
+                image_paths=image_paths,
             )
         except Exception as exc:  # pragma: no cover
             error_box["error"] = exc
@@ -1678,10 +1723,15 @@ def start_watcher(client, channel, thread_ts, thread_key, session_id, last_event
     return watcher
 
 
-def process_prompt(client, channel, thread_ts, prompt, user_id):
+def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payload=None):
     thread_key = make_thread_key(channel, thread_ts)
     try:
-        if not prompt:
+        image_download_specs = (
+            slack_image_inputs.build_image_downloads_from_event(slack_event_payload)
+            if slack_event_payload
+            else []
+        )
+        if not prompt and not image_download_specs:
             client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
@@ -2354,6 +2404,9 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             text=f"<@{user_id}> {fresh_error}",
                         )
                         return
+                if not effective_prompt and image_download_specs:
+                    effective_prompt = DEFAULT_IMAGE_ONLY_PROMPT
+
                 if not effective_prompt:
                     client.chat_postMessage(
                         channel=channel,
@@ -2409,62 +2462,86 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     session_id=existing_session_id,
                     session_origin=run_session_origin,
                 )
-
-                with session_execution_guard(existing_session_id):
-                    codex_result = run_codex_with_updates(
-                        client,
-                        channel,
-                        thread_ts,
-                        effective_prompt,
-                        session_id=existing_session_id,
-                        enable_progress=True,
-                        reasoning_effort=reasoning_effort,
-                        workdir_override=run_workdir,
-                    )
-                    next_session_id = codex_result.session_id
-                    result = codex_result.text
-                    print(
-                        "[codex_result]"
-                        f" thread_key={thread_key}"
-                        f" result_length={len(result or '')}",
-                        flush=True,
-                    )
-                    if existing_session_id and should_rebuild_invalid_session(codex_result):
-                        log_session_event(
-                            "resume_failed_rebuild",
-                            thread_key,
-                            existing_session_id=existing_session_id,
+                image_paths = []
+                image_download_dir = None
+                if image_download_specs:
+                    image_download_dir = tempfile.mkdtemp(prefix="codex-slack-images-")
+                    try:
+                        image_paths = slack_image_inputs.download_slack_image_files(
+                            image_download_specs,
+                            ENV.get("SLACK_BOT_TOKEN", ""),
+                            download_dir=image_download_dir,
                         )
-                        SESSION_STORE.clear_session_binding(thread_key)
+                    except Exception as exc:
+                        slack_image_inputs.cleanup_download_directory(image_download_dir)
                         client.chat_postMessage(
                             channel=channel,
                             thread_ts=thread_ts,
-                            text=f"<@{user_id}> 当前 Slack thread 的 Codex 会话不可恢复，正在自动重建新会话。",
+                            text=f"<@{user_id}> 下载 Slack 图片失败，暂时无法把这条图片消息传给 Codex。\n\n{exc}",
                         )
-                        rebuilt_reasoning_effort, _rebuilt_effort_source = resolve_reasoning_effort(
-                            thread_key,
-                            session_id=None,
-                            session_origin=SESSION_ORIGIN_SLACK,
-                        )
+                        return
+
+                try:
+                    with session_execution_guard(existing_session_id):
                         codex_result = run_codex_with_updates(
                             client,
                             channel,
                             thread_ts,
                             effective_prompt,
+                            session_id=existing_session_id,
                             enable_progress=True,
-                            reasoning_effort=rebuilt_reasoning_effort,
+                            reasoning_effort=reasoning_effort,
                             workdir_override=run_workdir,
+                            image_paths=image_paths,
                         )
                         next_session_id = codex_result.session_id
                         result = codex_result.text
-                        run_session_origin = SESSION_ORIGIN_SLACK
                         print(
                             "[codex_result]"
                             f" thread_key={thread_key}"
-                            f" rebuilt=1"
                             f" result_length={len(result or '')}",
                             flush=True,
                         )
+                        if existing_session_id and should_rebuild_invalid_session(codex_result):
+                            log_session_event(
+                                "resume_failed_rebuild",
+                                thread_key,
+                                existing_session_id=existing_session_id,
+                            )
+                            SESSION_STORE.clear_session_binding(thread_key)
+                            client.chat_postMessage(
+                                channel=channel,
+                                thread_ts=thread_ts,
+                                text=f"<@{user_id}> 当前 Slack thread 的 Codex 会话不可恢复，正在自动重建新会话。",
+                            )
+                            rebuilt_reasoning_effort, _rebuilt_effort_source = resolve_reasoning_effort(
+                                thread_key,
+                                session_id=None,
+                                session_origin=SESSION_ORIGIN_SLACK,
+                            )
+                            codex_result = run_codex_with_updates(
+                                client,
+                                channel,
+                                thread_ts,
+                                effective_prompt,
+                                enable_progress=True,
+                                reasoning_effort=rebuilt_reasoning_effort,
+                                workdir_override=run_workdir,
+                                image_paths=image_paths,
+                            )
+                            next_session_id = codex_result.session_id
+                            result = codex_result.text
+                            run_session_origin = SESSION_ORIGIN_SLACK
+                            print(
+                                "[codex_result]"
+                                f" thread_key={thread_key}"
+                                f" rebuilt=1"
+                                f" result_length={len(result or '')}",
+                                flush=True,
+                            )
+                finally:
+                    slack_image_inputs.cleanup_downloaded_files(image_paths)
+                    slack_image_inputs.cleanup_download_directory(image_download_dir)
 
                 if should_update_session_activity(codex_result) and next_session_id != existing_session_id:
                     SESSION_STORE.set(
@@ -2504,10 +2581,10 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
         raise
 
 
-def start_background_job(client, channel, thread_ts, prompt, user_id):
+def start_background_job(client, channel, thread_ts, prompt, user_id, slack_event_payload=None):
     thread = threading.Thread(
         target=process_prompt,
-        args=(client, channel, thread_ts, prompt, user_id),
+        args=(client, channel, thread_ts, prompt, user_id, slack_event_payload),
         daemon=True,
     )
     thread.start()
@@ -2533,16 +2610,109 @@ def format_home_timestamp(unix_ts):
         return "-"
 
 
+def get_home_binding_label(thread_key):
+    channel_id = str(thread_key or "").strip().partition(":")[0].upper()
+    if not channel_id:
+        return thread_key or "Slack Thread"
+    if channel_id.startswith("D"):
+        return "Direct Message"
+    if channel_id.startswith("C"):
+        return "Channel Thread"
+    if channel_id.startswith("G"):
+        return "Private Channel Thread"
+    return f"Thread {channel_id}"
+
+
+def encode_home_binding_value(thread_key, session_id):
+    return json.dumps(
+        {
+            "thread_key": str(thread_key or "").strip(),
+            "session_id": str(session_id or "").strip(),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def decode_home_binding_value(raw_value):
+    payload = json.loads(str(raw_value or ""))
+    if not isinstance(payload, dict):
+        raise RuntimeError("binding payload invalid")
+    thread_key = str(payload.get("thread_key") or "").strip()
+    session_id = str(payload.get("session_id") or "").strip()
+    if not thread_key or not session_id:
+        raise RuntimeError("binding payload incomplete")
+    return thread_key, session_id
+
+
+def build_home_rename_modal(*, thread_key, session_id, initial_title=""):
+    initial = str(initial_title or "").strip()
+    return {
+        "type": "modal",
+        "callback_id": "binding_rename_submit",
+        "private_metadata": encode_home_binding_value(thread_key, session_id),
+        "title": {"type": "plain_text", "text": "Rename Binding"},
+        "submit": {"type": "plain_text", "text": "Save"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": "binding_rename_input",
+                "label": {"type": "plain_text", "text": "Title"},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "title",
+                    "initial_value": initial,
+                    "placeholder": {"type": "plain_text", "text": "e.g. runner resume test"},
+                },
+            }
+        ],
+    }
+
+
+def extract_view_state_value(view_state, block_id, action_id):
+    values = ((view_state or {}).get("values") or {})
+    block = values.get(block_id) or {}
+    action = block.get(action_id) or {}
+    value = str(action.get("value") or "").strip()
+    return value
+
+
+def get_thread_display_title(session_id):
+    if not session_id:
+        return None
+    with suppress(Exception):
+        thread_response = read_thread_response(session_id)
+        thread = read_field(thread_response, "thread", thread_response)
+        title = str(read_field(thread, "name", "") or "").strip()
+        if title:
+            return title
+        preview = str(read_field(thread, "preview", "") or "").strip()
+        if preview:
+            return truncate_text(preview, max_length=80)
+    return None
+
+
 def get_home_bindings_rows(user_id, limit=5):
     raw_rows = SESSION_STORE.list_for_owner(user_id, limit=limit)
     rows = []
     for row in raw_rows:
+        fallback_label = get_home_binding_label(row.get("thread_key", ""))
+        title = get_thread_display_title(row.get("session_id", ""))
         rows.append(
             {
+                "label": title or fallback_label,
                 "session_id": row.get("session_id", "-"),
                 "mode": row.get("mode", "-"),
                 "cwd": row.get("cwd", "-"),
                 "updated_at": format_home_timestamp(row.get("updated_at")),
+                "status_text": fallback_label if title and title != fallback_label else None,
+                "action_id": "binding_rename_open",
+                "action_text": "Rename",
+                "action_value": encode_home_binding_value(
+                    row.get("thread_key", ""),
+                    row.get("session_id", ""),
+                ),
             }
         )
     return rows
@@ -2572,6 +2742,7 @@ def get_home_recent_sessions_rows(limit=5):
     for summary in summaries[:limit]:
         rows.append(
             {
+                "label": summary.name or summary.preview or "(untitled)",
                 "thread_id": summary.thread_id or "-",
                 "title": summary.name or summary.preview or "(untitled)",
                 "cwd": summary.cwd or "-",
@@ -2583,11 +2754,13 @@ def get_home_recent_sessions_rows(limit=5):
 
 def publish_home_view(client, user_id):
     codex_bin, model, default_workdir, timeout, sandbox, _extra_args, full_auto = get_codex_settings()
-    bindings_summary = slack_home.format_binding_summary_rows(get_home_bindings_rows(user_id, limit=5))
-    recent_sessions_summary = slack_home.format_recent_sessions_rows(get_home_recent_sessions_rows(limit=5))
+    binding_rows = get_home_bindings_rows(user_id, limit=5)
+    recent_rows = get_home_recent_sessions_rows(limit=5)
+    bindings_summary = slack_home.format_binding_summary_rows(binding_rows)
+    recent_sessions_summary = slack_home.format_recent_sessions_rows(recent_rows)
     help_text = (
         "Use `refresh` in Home, or continue controlling sessions in thread with "
-        "`attach`, `watch`, `control/takeover`, `observe`, and `status`."
+        "`attach`, `watch`, `control/takeover`, `observe`, `interrupt`, `steer`, and `status`."
     )
     view = slack_home.build_home_view(
         default_workdir=default_workdir,
@@ -2595,6 +2768,14 @@ def publish_home_view(client, user_id):
         default_effort=get_default_reasoning_effort(),
         bindings_summary=bindings_summary,
         recent_sessions_summary=recent_sessions_summary,
+        bindings_rows=binding_rows,
+        recent_sessions_rows=recent_rows,
+        quick_hints=[
+            "Use `watch` for passive mirroring from terminal to phone.",
+            "Use `takeover` when Slack should become the writing side.",
+            "Use `Rename` in Home to give long-lived bindings a human title.",
+            "Image uploads can be passed through to Codex in DM or mention threads.",
+        ],
         help_text=(
             f"{help_text}\nConfig: sandbox=`{sandbox}` timeout=`{timeout}` "
             f"full_auto=`{'1' if full_auto else '0'}` codex_bin=`{codex_bin}`"
@@ -2653,6 +2834,79 @@ def build_app():
         except Exception as exc:  # pragma: no cover
             logger.exception("Failed refreshing App Home for %s: %r", user_id, exc)
 
+    @app.action("binding_rename_open")
+    def handle_binding_rename_open(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected binding_rename_open from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            thread_key, session_id = decode_home_binding_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid binding rename payload from %s: %r", user_id, exc)
+            return
+        if get_thread_owner_access_error(thread_key, user_id):
+            logger.warning("Rejected binding rename for non-owner user %s thread %s", user_id, thread_key)
+            return
+        initial_title = ""
+        with suppress(Exception):
+            thread_response = read_thread_response(session_id)
+            thread = read_field(thread_response, "thread", thread_response)
+            initial_title = read_field(thread, "name", "") or ""
+        trigger_id = body.get("trigger_id", "")
+        if not trigger_id:
+            return
+        try:
+            client.views_open(
+                trigger_id=trigger_id,
+                view=build_home_rename_modal(
+                    thread_key=thread_key,
+                    session_id=session_id,
+                    initial_title=initial_title,
+                ),
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed opening binding rename modal for %s: %r", user_id, exc)
+
+    @app.view("binding_rename_submit")
+    def handle_binding_rename_submit(ack, body, view, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected binding_rename_submit from unauthorized user %s", user_id)
+            return
+        try:
+            thread_key, session_id = decode_home_binding_value(view.get("private_metadata"))
+            if get_thread_owner_access_error(thread_key, user_id):
+                logger.warning("Rejected binding rename submit for non-owner user %s thread %s", user_id, thread_key)
+                return
+            title = extract_view_state_value(view.get("state"), "binding_rename_input", "title")
+            normalized_title = thread_views.rename_thread(
+                get_codex_app_server_config(),
+                session_id,
+                title,
+            )
+            publish_home_view(client, user_id)
+            print(
+                "[home_rename]"
+                f" user={user_id}"
+                f" thread_key={thread_key}"
+                f" session_id={session_id}"
+                f" title={json.dumps(normalized_title, ensure_ascii=True)}",
+                flush=True,
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed submitting binding rename for %s: %r", user_id, exc)
+
     @app.event("app_mention")
     def handle_app_mention(body, client, logger):
         event = body.get("event", {})
@@ -2672,12 +2926,15 @@ def build_app():
             )
             return
         logger.info("Handling app_mention in channel %s", channel)
-        start_background_job(client, channel, thread_ts, prompt, user_id)
+        start_background_job(client, channel, thread_ts, prompt, user_id, slack_event_payload=body)
 
     @app.event("message")
     def handle_direct_message(body, client, logger):
         event = body.get("event", {})
-        if event.get("bot_id") or event.get("subtype"):
+        if event.get("bot_id"):
+            return
+        subtype = str(event.get("subtype") or "").strip()
+        if subtype and subtype != "file_share":
             return
         if event.get("channel_type") != "im":
             return
@@ -2695,7 +2952,7 @@ def build_app():
             )
             return
         logger.info("Handling direct message in channel %s", channel)
-        start_background_job(client, channel, thread_ts, prompt, user_id)
+        start_background_job(client, channel, thread_ts, prompt, user_id, slack_event_payload=body)
 
     return app
 
