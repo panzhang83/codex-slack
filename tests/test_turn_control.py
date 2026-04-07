@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import server
 import turn_control
+from app_runtime import RuntimeActiveTurn
 from codex_threads import CodexAppServerConfig
 
 
@@ -35,6 +36,36 @@ class DummyClient:
 
     def chat_postMessage(self, **kwargs):
         self.messages.append(kwargs)
+
+
+class FakeRuntime:
+    def __init__(self, active_turn=None, steer_error=None, interrupt_error=None):
+        self.active_turn = active_turn
+        self.steer_error = steer_error
+        self.interrupt_error = interrupt_error
+        self.steer_calls = []
+        self.interrupt_calls = []
+
+    def get_active_turn(self, session_id):
+        if self.active_turn and self.active_turn.session_id == session_id:
+            return self.active_turn
+        return None
+
+    def steer_active_turn(self, active_turn, text):
+        self.steer_calls.append((active_turn.session_id, active_turn.turn_id, text))
+        if self.steer_error:
+            raise self.steer_error
+        if not self.active_turn or self.active_turn.session_id != active_turn.session_id:
+            raise RuntimeError("no active runtime turn")
+        return self.active_turn
+
+    def interrupt_active_turn(self, active_turn):
+        self.interrupt_calls.append((active_turn.session_id, active_turn.turn_id))
+        if self.interrupt_error:
+            raise self.interrupt_error
+        if not self.active_turn or self.active_turn.session_id != active_turn.session_id:
+            raise RuntimeError("no active runtime turn")
+        return self.active_turn
 
 
 class TurnControlHelperTests(unittest.TestCase):
@@ -93,6 +124,14 @@ class TurnCommandParsingTests(unittest.TestCase):
         self.assertTrue(server.is_steer_command("steer focus tests"))
         self.assertEqual(server.strip_steer_command("/steer keep it short"), "keep it short")
 
+    def test_steer_command_with_chinese_payload_is_detected(self):
+        text = "steer 源码类还应该包括 jl (julia 文件），是否可能包含 ipynb 文件？"
+        self.assertTrue(server.is_steer_command(text))
+        self.assertEqual(
+            server.strip_steer_command(text),
+            "源码类还应该包括 jl (julia 文件），是否可能包含 ipynb 文件？",
+        )
+
 
 class ProcessPromptTurnCommandTests(unittest.TestCase):
     def setUp(self):
@@ -120,30 +159,41 @@ class ProcessPromptTurnCommandTests(unittest.TestCase):
         server.process_prompt(self.client, self.channel, self.thread_ts, "interrupt", self.user_id)
         self.assertIn("还没有 Codex session", self.client.messages[0]["text"])
 
-    def test_interrupt_allowed_in_observe_mode(self):
+    def test_interrupt_requires_runtime_owned_active_turn(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
         self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
-        active_turn = turn_control.ActiveTurnInfo(thread_id=self.session_id, turn_id="turn-123", status="inProgress")
+        runtime = FakeRuntime(active_turn=None)
 
-        with patch.object(server, "get_codex_app_server_config", return_value=make_config()) as get_cfg:
-            with patch.object(server, "interrupt_active_turn", return_value=active_turn) as interrupt_active_turn:
-                server.process_prompt(self.client, self.channel, self.thread_ts, "interrupt", self.user_id)
+        with patch.object(server, "get_app_runtime", return_value=runtime):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "interrupt", self.user_id)
 
-        get_cfg.assert_called_once()
-        interrupt_active_turn.assert_called_once_with(make_config(), self.session_id)
+        self.assertEqual(runtime.interrupt_calls, [])
+        self.assertIn("当前没有由 codex-slack runtime 持有的活跃 turn", self.client.messages[0]["text"])
+
+    def test_interrupt_in_observe_mode_can_stop_runtime_owned_turn(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
+        active_turn = RuntimeActiveTurn(
+            session_id=self.session_id,
+            turn_id="turn-123",
+            started_at=0,
+        )
+        runtime = FakeRuntime(active_turn=active_turn)
+
+        with patch.object(server, "get_app_runtime", return_value=runtime):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "interrupt", self.user_id)
+
+        self.assertEqual(runtime.interrupt_calls, [(self.session_id, "turn-123")])
         self.assertIn("已发送中断请求", self.client.messages[0]["text"])
-        cached = server.ACTIVE_TURN_REGISTRY.get_for_thread(self.thread_key)
-        self.assertIsNotNone(cached)
-        self.assertEqual(cached.turn_id, "turn-123")
 
     def test_steer_requires_control_mode(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
         self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
 
-        with patch.object(server, "steer_active_turn") as steer_active_turn:
+        with patch.object(server, "get_app_runtime", return_value=FakeRuntime()) as get_app_runtime:
             server.process_prompt(self.client, self.channel, self.thread_ts, "steer focus tests", self.user_id)
 
-        steer_active_turn.assert_not_called()
+        get_app_runtime.assert_not_called()
         self.assertIn("`steer` 只在 `control` 模式下可用", self.client.messages[0]["text"])
 
     def test_steer_requires_payload(self):
@@ -157,24 +207,72 @@ class ProcessPromptTurnCommandTests(unittest.TestCase):
     def test_steer_in_control_mode_calls_turn_control(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
         self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
-        active_turn = turn_control.ActiveTurnInfo(thread_id=self.session_id, turn_id="turn-456", status="inProgress")
-
-        with patch.object(server, "get_codex_app_server_config", return_value=make_config()) as get_cfg:
-            with patch.object(server, "steer_active_turn", return_value=active_turn) as steer_active_turn:
-                server.process_prompt(self.client, self.channel, self.thread_ts, "steer focus on failing tests first", self.user_id)
-
-        get_cfg.assert_called_once()
-        steer_active_turn.assert_called_once_with(
-            make_config(),
-            self.session_id,
-            "focus on failing tests first",
+        active_turn = RuntimeActiveTurn(
+            session_id=self.session_id,
+            turn_id="turn-456",
+            started_at=0,
         )
+        runtime = FakeRuntime(active_turn=active_turn)
+
+        with patch.object(server, "get_app_runtime", return_value=runtime):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "steer focus on failing tests first", self.user_id)
+
+        self.assertEqual(runtime.steer_calls, [(self.session_id, "turn-456", "focus on failing tests first")])
         text = self.client.messages[0]["text"]
         self.assertIn("已向 session", text)
         self.assertIn("turn-456", text)
         cached = server.ACTIVE_TURN_REGISTRY.get_for_thread(self.thread_key)
         self.assertIsNotNone(cached)
         self.assertEqual(cached.turn_id, "turn-456")
+
+    def test_steer_can_use_registry_session_id_before_store_is_bound(self):
+        active_turn = RuntimeActiveTurn(
+            session_id=self.session_id,
+            turn_id="turn-789",
+            started_at=0,
+        )
+        runtime = FakeRuntime(active_turn=active_turn)
+        server.ACTIVE_TURN_REGISTRY.set(self.thread_key, self.session_id, "turn-789")
+
+        with patch.object(server, "get_app_runtime", return_value=runtime):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "steer keep going", self.user_id)
+
+        self.assertEqual(runtime.steer_calls, [(self.session_id, "turn-789", "keep going")])
+        self.assertIn("turn-789", self.client.messages[0]["text"])
+
+    def test_interrupt_runtime_failure_is_reported_instead_of_reclassified(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        active_turn = RuntimeActiveTurn(
+            session_id=self.session_id,
+            turn_id="turn-999",
+            started_at=0,
+        )
+        runtime = FakeRuntime(active_turn=active_turn, interrupt_error=RuntimeError("transport exploded"))
+
+        with patch.object(server, "get_app_runtime", return_value=runtime):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "interrupt", self.user_id)
+
+        self.assertEqual(runtime.interrupt_calls, [(self.session_id, "turn-999")])
+        self.assertIn("中断当前 turn 失败", self.client.messages[0]["text"])
+        self.assertIn("transport exploded", self.client.messages[0]["text"])
+
+    def test_steer_runtime_failure_is_reported_instead_of_reclassified(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        active_turn = RuntimeActiveTurn(
+            session_id=self.session_id,
+            turn_id="turn-321",
+            started_at=0,
+        )
+        runtime = FakeRuntime(active_turn=active_turn, steer_error=RuntimeError("steer rejected"))
+
+        with patch.object(server, "get_app_runtime", return_value=runtime):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "steer focus", self.user_id)
+
+        self.assertEqual(runtime.steer_calls, [(self.session_id, "turn-321", "focus")])
+        self.assertIn("steer 失败", self.client.messages[0]["text"])
+        self.assertIn("steer rejected", self.client.messages[0]["text"])
 
 
 if __name__ == "__main__":

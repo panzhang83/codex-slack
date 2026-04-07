@@ -24,12 +24,18 @@ class SlackDocumentInputParsingTests(unittest.TestCase):
     def test_is_document_like_file_checks_multiple_signals(self):
         self.assertTrue(slack_document_inputs.is_document_like_file({"mimetype": "text/plain"}))
         self.assertTrue(slack_document_inputs.is_document_like_file({"mimetype": "application/pdf"}))
+        self.assertTrue(slack_document_inputs.is_document_like_file({"mimetype": "text/x-julia"}))
+        self.assertTrue(slack_document_inputs.is_document_like_file({"mimetype": "application/x-ipynb+json"}))
         self.assertTrue(
             slack_document_inputs.is_document_like_file(
                 {"mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
             )
         )
         self.assertTrue(slack_document_inputs.is_document_like_file({"name": "notes.md"}))
+        self.assertTrue(slack_document_inputs.is_document_like_file({"name": "analysis.jl"}))
+        self.assertTrue(slack_document_inputs.is_document_like_file({"name": "notebook.ipynb"}))
+        self.assertTrue(slack_document_inputs.is_document_like_file({"filetype": "julia"}))
+        self.assertTrue(slack_document_inputs.is_document_like_file({"filetype": "notebook"}))
         self.assertFalse(slack_document_inputs.is_document_like_file({"name": "photo.png", "mimetype": "image/png"}))
         self.assertFalse(slack_document_inputs.is_document_like_file({"name": "archive.zip"}))
 
@@ -70,6 +76,16 @@ class SlackDocumentInputParsingTests(unittest.TestCase):
             "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         }
         self.assertEqual(slack_document_inputs.choose_download_filename(file_obj), "proposal.docx")
+
+    def test_choose_download_filename_uses_julia_and_notebook_hints(self):
+        self.assertEqual(
+            slack_document_inputs.choose_download_filename({"id": "F1", "name": "script", "filetype": "julia"}),
+            "script.jl",
+        )
+        self.assertEqual(
+            slack_document_inputs.choose_download_filename({"id": "F2", "name": "experiment", "filetype": "notebook"}),
+            "experiment.ipynb",
+        )
 
 
 class SlackDocumentDownloadTests(unittest.TestCase):

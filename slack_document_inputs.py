@@ -31,6 +31,7 @@ DOCUMENT_EXTENSIONS = {
     ".py",
     ".sh",
     ".java",
+    ".jl",
     ".go",
     ".rs",
     ".c",
@@ -51,8 +52,10 @@ DOCUMENT_EXTENSIONS = {
 MIME_EXTENSION_HINTS = {
     "text/plain": ".txt",
     "text/markdown": ".md",
+    "text/x-julia": ".jl",
     "application/json": ".json",
     "application/x-ndjson": ".jsonl",
+    "application/x-ipynb+json": ".ipynb",
     "application/yaml": ".yaml",
     "application/x-yaml": ".yaml",
     "application/xml": ".xml",
@@ -67,6 +70,13 @@ MIME_EXTENSION_HINTS = {
 }
 
 DOCUMENT_MIME_TYPES = set(MIME_EXTENSION_HINTS)
+
+FILETYPE_EXTENSION_HINTS = {
+    "docx": ".docx",
+    "ipynb": ".ipynb",
+    "julia": ".jl",
+    "notebook": ".ipynb",
+}
 
 
 @dataclass(frozen=True)
@@ -99,6 +109,14 @@ def _extension_from_name(name):
     return _normalize_extension(Path(basename).suffix)
 
 
+def _extension_from_filetype(filetype):
+    normalized = _normalize_extension(filetype)
+    if normalized in DOCUMENT_EXTENSIONS:
+        return normalized
+    alias = str(filetype or "").strip().lower()
+    return FILETYPE_EXTENSION_HINTS.get(alias, "")
+
+
 def _sanitize_filename_component(value):
     basename = Path(str(value or "")).name
     stem = Path(basename).stem
@@ -120,7 +138,7 @@ def is_document_like_file(file_obj):
     if mimetype in DOCUMENT_MIME_TYPES:
         return True
 
-    filetype = _normalize_extension(file_obj.get("filetype"))
+    filetype = _extension_from_filetype(file_obj.get("filetype"))
     if filetype in DOCUMENT_EXTENSIONS:
         return True
 
@@ -137,7 +155,7 @@ def _guess_extension(file_obj, fallback_name):
     if mimetype in MIME_EXTENSION_HINTS:
         return MIME_EXTENSION_HINTS[mimetype]
 
-    filetype = _normalize_extension(file_obj.get("filetype"))
+    filetype = _extension_from_filetype(file_obj.get("filetype"))
     if filetype in DOCUMENT_EXTENSIONS:
         return filetype
     return ".txt"

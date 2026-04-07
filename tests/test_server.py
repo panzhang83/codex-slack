@@ -68,6 +68,8 @@ class CommandParsingTests(unittest.TestCase):
         self.assertEqual(server.strip_effort_command("/effort reset"), "reset")
         self.assertTrue(server.is_name_command("name flaky tests"))
         self.assertEqual(server.strip_name_command("/name keep it short"), "keep it short")
+        self.assertTrue(server.is_progress_command("progress off"))
+        self.assertEqual(server.strip_progress_command("/progress reset"), "reset")
         self.assertTrue(server.is_status_command("whoami"))
         self.assertTrue(server.is_session_command("session id"))
         self.assertTrue(server.is_watch_command("/watch"))
@@ -93,6 +95,44 @@ class CommandParsingTests(unittest.TestCase):
         self.assertEqual(server.parse_sessions_payload(""), (False, None))
         self.assertEqual(server.parse_sessions_payload("--all"), (True, None))
         self.assertEqual(server.parse_sessions_payload("--cwd /tmp/project"), (False, "/tmp/project"))
+
+
+class SessionModeResolutionTests(unittest.TestCase):
+    def test_get_effective_session_mode_prefers_explicit_mode(self):
+        active_record = ns(session_id="sess-active")
+        self.assertEqual(
+            server.get_effective_session_mode(
+                "thread-1",
+                session_id="sess-store",
+                session_mode=server.SESSION_MODE_OBSERVE,
+                active_record=active_record,
+            ),
+            server.SESSION_MODE_OBSERVE,
+        )
+
+    def test_get_effective_session_mode_uses_matching_runtime_active_turn(self):
+        active_record = ns(session_id="sess-active")
+        self.assertEqual(
+            server.get_effective_session_mode(
+                "thread-1",
+                session_id="sess-active",
+                session_mode=None,
+                active_record=active_record,
+            ),
+            server.SESSION_MODE_CONTROL,
+        )
+
+    def test_get_effective_session_mode_returns_none_without_match(self):
+        active_record = ns(session_id="sess-other")
+        self.assertIsNone(
+            server.get_effective_session_mode(
+                "thread-1",
+                session_id="sess-store",
+                session_mode=None,
+                active_record=active_record,
+            )
+        )
+        self.assertIsNone(server.get_effective_session_mode("thread-1", session_id=None, session_mode=None))
 
 
 class SlackAccessTests(unittest.TestCase):
@@ -161,6 +201,23 @@ class SlackAccessTests(unittest.TestCase):
 
 
 class SessionStoreTests(unittest.TestCase):
+    def test_get_mode_returns_none_when_thread_has_no_session_entry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
+
+        self.assertIsNone(store.get_mode("C1:1"))
+
+    def test_get_mode_defaults_legacy_session_entries_to_control(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.json"
+            path.write_text(
+                '{\n  "C1:1": {\n    "session_id": "019d5868-71ba-7101-9143-81867f3db5bf",\n    "updated_at": 1\n  }\n}\n',
+                encoding="utf-8",
+            )
+            store = server.SlackThreadSessionStore(path)
+
+        self.assertEqual(store.get_mode("C1:1"), server.SESSION_MODE_CONTROL)
+
     def test_set_and_reload_preserves_reasoning_effort_session_origin_and_cwd(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "sessions.json"
@@ -373,8 +430,52 @@ class ConversationExtractionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "sdk failed"):
                 server.read_conversation_events("019d5868-71ba-7101-9143-81867f3db5bf")
 
+    def test_advance_watch_cursor_emits_incremental_dialogue_without_heading(self):
+        events = [
+            server.ConversationEvent("turn-0", "u0", "user", "previous"),
+            server.ConversationEvent("turn-0", "a0", "assistant", "done previous"),
+            server.ConversationEvent("turn-1", "u1", "user", "hello"),
+            server.ConversationEvent("turn-1", "a1", "assistant", "done"),
+        ]
+
+        message, last_key, rebased = server.advance_watch_cursor(events, ("turn-0", "a0"))
+
+        self.assertFalse(rebased)
+        self.assertEqual(last_key, ("turn-1", "a1"))
+        self.assertEqual(message, "*User*\n> hello\n\n*Codex*\n> done")
+
+    def test_advance_watch_cursor_rebases_silently_when_anchor_is_missing(self):
+        events = [
+            server.ConversationEvent("turn-2", "u2", "user", "next"),
+            server.ConversationEvent("turn-2", "a2", "assistant", "done"),
+        ]
+
+        message, last_key, rebased = server.advance_watch_cursor(events, ("missing", "key"))
+
+        self.assertTrue(rebased)
+        self.assertEqual(last_key, ("turn-2", "a2"))
+        self.assertIsNone(message)
+
 
 class CodexHelperTests(unittest.TestCase):
+    def test_read_thread_cwd_uses_metadata_only_thread_read(self):
+        with patch.object(server, "read_thread_response", return_value={"thread": {"cwd": "/tmp/project"}}) as mock_read:
+            cwd = server.read_thread_cwd("019d5868-71ba-7101-9143-81867f3db5bf")
+
+        self.assertEqual(cwd, "/tmp/project")
+        mock_read.assert_called_once_with("019d5868-71ba-7101-9143-81867f3db5bf", include_turns=False)
+
+    def test_get_thread_display_title_uses_metadata_only_thread_read(self):
+        with patch.object(
+            server,
+            "read_thread_response",
+            return_value={"thread": {"name": "triage flaky test", "preview": "ignored"}},
+        ) as mock_read:
+            title = server.get_thread_display_title("019d5868-71ba-7101-9143-81867f3db5bf")
+
+        self.assertEqual(title, "triage flaky test")
+        mock_read.assert_called_once_with("019d5868-71ba-7101-9143-81867f3db5bf", include_turns=False)
+
     def test_resolve_reasoning_effort_prefers_thread_override(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
@@ -563,7 +664,71 @@ class CodexHelperTests(unittest.TestCase):
         self.assertEqual(tracker.get(), "019d5868-71ba-7101-9143-81867f3db5bf")
 
 
+class RuntimePolicyTests(unittest.TestCase):
+    def test_resolve_runtime_policy_settings_respects_extra_args_full_auto(self):
+        with patch.dict(
+            server.ENV,
+            {
+                "CODEX_EXTRA_ARGS": "--full-auto --approval-policy on-failure",
+                "CODEX_FULL_AUTO": "0",
+                "CODEX_SANDBOX_MODE": "read-only",
+            },
+            clear=False,
+        ):
+            sandbox, approval_policy = server.resolve_runtime_policy_settings()
+
+        self.assertEqual(sandbox, "workspace-write")
+        self.assertEqual(approval_policy, "on-failure")
+
+    def test_resolve_runtime_policy_settings_respects_dangerous_bypass_flag(self):
+        with patch.dict(
+            server.ENV,
+            {
+                "CODEX_EXTRA_ARGS": "--dangerously-bypass-approvals-and-sandbox",
+                "CODEX_FULL_AUTO": "0",
+                "CODEX_SANDBOX_MODE": "read-only",
+            },
+            clear=False,
+        ):
+            sandbox, approval_policy = server.resolve_runtime_policy_settings()
+
+        self.assertEqual(sandbox, "danger-full-access")
+        self.assertEqual(approval_policy, "never")
+
+
 class ProgressExtractionTests(unittest.TestCase):
+    def test_async_progress_reporter_batches_messages(self):
+        client = DummyClient()
+        reporter = server.AsyncProgressReporter(client, "C1", "1", batch_seconds=0.05)
+        self.addCleanup(reporter.close)
+
+        reporter.enqueue("*Codex Progress*\n> first")
+        reporter.enqueue("*Codex Progress*\n> second")
+        deadline = time.monotonic() + 1.5
+        while len(client.messages) < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(len(client.messages), 1)
+        self.assertEqual(
+            client.messages[0]["text"],
+            "*Codex Progress*\n> first\n\n*Codex Progress*\n> second",
+        )
+
+    def test_async_progress_reporter_flushes_immediately(self):
+        client = DummyClient()
+        reporter = server.AsyncProgressReporter(client, "C1", "1", batch_seconds=10)
+        self.addCleanup(reporter.close)
+
+        reporter.enqueue("*Codex Progress*\n> first")
+        reporter.enqueue("*Codex Progress*\n> second")
+        reporter.flush()
+
+        self.assertEqual(len(client.messages), 1)
+        self.assertEqual(
+            client.messages[0]["text"],
+            "*Codex Progress*\n> first\n\n*Codex Progress*\n> second",
+        )
+
     def test_extract_progress_events_keeps_non_final_agent_messages(self):
         response = make_thread_response(
             make_turn(
@@ -648,6 +813,139 @@ class ProgressExtractionTests(unittest.TestCase):
         self.assertEqual(result.session_id, discovered_session_id)
         self.assertEqual(progress_calls, [(discovered_session_id, {})])
 
+    def test_run_runtime_turn_with_updates_emits_only_filtered_agent_progress(self):
+        discovered_session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
+        client = DummyClient()
+
+        class FakeRuntime:
+            def run_turn(
+                self,
+                *,
+                session_id=None,
+                input_items=None,
+                thread_config=None,
+                turn_overrides=None,
+                heartbeat_seconds=None,
+                on_turn_started=None,
+                on_step=None,
+                on_heartbeat=None,
+            ):
+                on_turn_started(discovered_session_id, "turn-1")
+                on_step(ns(text='/bin/zsh -lc "pwd"', step_type="exec", item_type="commandExecution", data={}, turn_id="turn-1", item_id="c1"))
+                on_step(
+                    ns(
+                        text="正在检查测试并准备修复。",
+                        step_type="codex",
+                        item_type="agentMessage",
+                        data={"item": {"phase": "commentary"}},
+                        turn_id="turn-1",
+                        item_id="a1",
+                    )
+                )
+                on_step(
+                    ns(
+                        text="最终答案",
+                        step_type="codex",
+                        item_type="agentMessage",
+                        data={"item": {"phase": "final_answer"}},
+                        turn_id="turn-1",
+                        item_id="a2",
+                    )
+                )
+                return ns(
+                    session_id=discovered_session_id,
+                    final_text="done",
+                    steps=[],
+                )
+
+        with patch.object(server, "get_app_runtime", return_value=FakeRuntime()):
+            result = server.run_runtime_turn_with_updates(
+                client,
+                "C1",
+                "1",
+                "C1:1",
+                "continue",
+                session_id=None,
+                enable_progress=True,
+            )
+
+        self.assertEqual(result.session_id, discovered_session_id)
+        progress_messages = [message["text"] for message in client.messages if "Codex Progress" in message["text"]]
+        self.assertEqual(progress_messages, ["*Codex Progress*\n> 正在检查测试并准备修复。"])
+
+    def test_run_runtime_turn_with_updates_uses_reporter_and_flushes_before_return(self):
+        discovered_session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
+
+        class FakeReporter:
+            def __init__(self):
+                self.messages = []
+                self.flushed = False
+                self.closed = False
+
+            def enqueue(self, text):
+                self.messages.append(text)
+
+            def flush(self, timeout=10):
+                self.flushed = True
+
+            def close(self, timeout=10):
+                self.closed = True
+
+        class FakeRuntime:
+            def run_turn(
+                self,
+                *,
+                session_id=None,
+                input_items=None,
+                thread_config=None,
+                turn_overrides=None,
+                heartbeat_seconds=None,
+                on_turn_started=None,
+                on_step=None,
+                on_heartbeat=None,
+            ):
+                on_turn_started(discovered_session_id, "turn-1")
+                on_step(
+                    ns(
+                        text="正在检查测试并准备修复。",
+                        step_type="codex",
+                        item_type="agentMessage",
+                        data={"item": {"phase": "commentary"}},
+                        turn_id="turn-1",
+                        item_id="a1",
+                    )
+                )
+                on_heartbeat(discovered_session_id, "turn-1", 12)
+                return ns(
+                    session_id=discovered_session_id,
+                    final_text="done",
+                    steps=[],
+                )
+
+        fake_reporter = FakeReporter()
+        with patch.object(server, "get_app_runtime", return_value=FakeRuntime()):
+            with patch.object(server, "create_progress_reporter", return_value=fake_reporter):
+                result = server.run_runtime_turn_with_updates(
+                    DummyClient(),
+                    "C1",
+                    "1",
+                    "C1:1",
+                    "continue",
+                    session_id=None,
+                    enable_progress=True,
+                )
+
+        self.assertEqual(result.session_id, discovered_session_id)
+        self.assertEqual(
+            fake_reporter.messages,
+            [
+                "*Codex Progress*\n> 正在检查测试并准备修复。",
+                "仍在运行，已持续 12s。 session `019d5868-71ba-7101-9143-81867f3db5bf`",
+            ],
+        )
+        self.assertTrue(fake_reporter.flushed)
+        self.assertTrue(fake_reporter.closed)
+
 
 class ProcessPromptTests(unittest.TestCase):
     def setUp(self):
@@ -727,6 +1025,31 @@ class ProcessPromptTests(unittest.TestCase):
         )
         self.assertEqual(self.client.messages[0]["text"], "cwd list")
 
+    def test_progress_command_sets_thread_override(self):
+        server.process_prompt(self.client, self.channel, self.thread_ts, "progress off", self.user_id)
+
+        self.assertFalse(self.store.get_progress_updates(self.thread_key))
+        self.assertIn("progress 推送设置为 `off`", self.client.messages[0]["text"])
+
+    def test_progress_command_reset_clears_thread_override(self):
+        self.store.set_progress_updates(self.thread_key, False, owner_user_id=self.user_id)
+
+        with patch.dict(server.ENV, {"CODEX_PROGRESS_UPDATES": "1"}, clear=False):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "progress reset", self.user_id)
+
+        self.assertIsNone(self.store.get_progress_updates(self.thread_key))
+        self.assertIn("已清除当前 Slack thread 的 progress 设置覆盖", self.client.messages[0]["text"])
+
+    def test_progress_command_status_reports_effective_state(self):
+        self.store.set_progress_updates(self.thread_key, False, owner_user_id=self.user_id)
+
+        with patch.dict(server.ENV, {"CODEX_PROGRESS_UPDATES": "1"}, clear=False):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "progress", self.user_id)
+
+        text = self.client.messages[0]["text"]
+        self.assertIn("progress_updates_effective: `off`", text)
+        self.assertIn("progress_updates_source: `thread`", text)
+
     def test_attach_command_binds_session_in_observe_mode(self):
         with patch.dict(
             server.ENV,
@@ -786,6 +1109,68 @@ class ProcessPromptTests(unittest.TestCase):
         )
         self.assertIn("已将当前 session 重命名为 `triage flaky test`", self.client.messages[0]["text"])
 
+    def test_handoff_uses_runtime_path_for_controlled_session(self):
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_SLACK,
+            session_cwd="/tmp/runtime-project",
+        )
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="Current Goal:\ncontinue testing",
+            exit_code=0,
+            raw_output="",
+            final_output="Current Goal:\ncontinue testing",
+            json_output="",
+            cleaned_output="Current Goal:\ncontinue testing",
+            timed_out=False,
+        )
+
+        with patch.object(server, "read_thread_cwd", return_value="/tmp/runtime-project"):
+            with patch.object(server, "run_runtime_turn_with_updates", return_value=result) as run_runtime_turn_with_updates:
+                with patch.object(server, "run_codex_with_updates") as run_codex_with_updates:
+                    server.process_prompt(self.client, self.channel, self.thread_ts, "handoff", self.user_id)
+
+        run_runtime_turn_with_updates.assert_called_once()
+        run_codex_with_updates.assert_not_called()
+        self.assertEqual(run_runtime_turn_with_updates.call_args.args[4], server.build_handoff_prompt())
+        self.assertEqual(run_runtime_turn_with_updates.call_args.kwargs["session_id"], self.session_id)
+        self.assertEqual(run_runtime_turn_with_updates.call_args.kwargs["workdir_override"], "/tmp/runtime-project")
+
+    def test_recap_uses_runtime_path_for_controlled_session(self):
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_SLACK,
+            session_cwd="/tmp/runtime-project",
+        )
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="Recent Progress:\n- tested steer",
+            exit_code=0,
+            raw_output="",
+            final_output="Recent Progress:\n- tested steer",
+            json_output="",
+            cleaned_output="Recent Progress:\n- tested steer",
+            timed_out=False,
+        )
+
+        with patch.object(server, "read_thread_cwd", return_value="/tmp/runtime-project"):
+            with patch.object(server, "run_runtime_turn_with_updates", return_value=result) as run_runtime_turn_with_updates:
+                with patch.object(server, "run_codex_with_updates") as run_codex_with_updates:
+                    server.process_prompt(self.client, self.channel, self.thread_ts, "recap", self.user_id)
+
+        run_runtime_turn_with_updates.assert_called_once()
+        run_codex_with_updates.assert_not_called()
+        self.assertEqual(run_runtime_turn_with_updates.call_args.args[4], server.build_recap_prompt())
+        self.assertEqual(run_runtime_turn_with_updates.call_args.kwargs["session_id"], self.session_id)
+        self.assertEqual(run_runtime_turn_with_updates.call_args.kwargs["workdir_override"], "/tmp/runtime-project")
+
     def test_image_only_message_uses_default_prompt_and_image_paths(self):
         result = server.CodexRunResult(
             session_id=self.session_id,
@@ -809,7 +1194,11 @@ class ProcessPromptTests(unittest.TestCase):
             with patch.object(server.slack_image_inputs, "download_slack_image_files", return_value=[image_path]):
                 with patch.object(server.slack_image_inputs, "cleanup_downloaded_files") as cleanup_downloaded_files:
                     with patch.object(server.slack_image_inputs, "cleanup_download_directory") as cleanup_download_directory:
-                        with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+                        with patch.object(
+                            server,
+                            "run_runtime_turn_with_updates",
+                            return_value=result,
+                        ) as run_runtime_turn_with_updates:
                             server.process_prompt(
                                 self.client,
                                 self.channel,
@@ -819,8 +1208,8 @@ class ProcessPromptTests(unittest.TestCase):
                                 slack_event_payload={"event": {"files": [{"id": "F1"}]}},
                             )
 
-        self.assertEqual(run_codex_with_updates.call_args.kwargs["image_paths"], [image_path])
-        self.assertEqual(run_codex_with_updates.call_args.args[3], server.DEFAULT_IMAGE_ONLY_PROMPT)
+        self.assertEqual(run_runtime_turn_with_updates.call_args.kwargs["image_paths"], [image_path])
+        self.assertEqual(run_runtime_turn_with_updates.call_args.args[4], server.DEFAULT_IMAGE_ONLY_PROMPT)
         cleanup_downloaded_files.assert_called_once_with([image_path])
         cleanup_download_directory.assert_called_once()
 
@@ -876,7 +1265,11 @@ class ProcessPromptTests(unittest.TestCase):
                 with patch.object(server.slack_document_inputs, "download_slack_document_files", return_value=[downloaded_document]):
                     with patch.object(server.slack_document_inputs, "cleanup_downloaded_documents") as cleanup_downloaded_documents:
                         with patch.object(server.slack_document_inputs, "cleanup_download_directory") as cleanup_download_directory:
-                            with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+                            with patch.object(
+                                server,
+                                "run_runtime_turn_with_updates",
+                                return_value=result,
+                            ) as run_runtime_turn_with_updates:
                                 server.process_prompt(
                                     self.client,
                                     self.channel,
@@ -886,7 +1279,7 @@ class ProcessPromptTests(unittest.TestCase):
                                     slack_event_payload={"event": {"files": [{"id": "F1"}]}},
                                 )
 
-        prompt = run_codex_with_updates.call_args.args[3]
+        prompt = run_runtime_turn_with_updates.call_args.args[4]
         self.assertIn(server.DEFAULT_DOCUMENT_ONLY_PROMPT, prompt)
         self.assertIn("report.pdf", prompt)
         self.assertIn("/tmp/report.pdf", prompt)
@@ -922,7 +1315,11 @@ class ProcessPromptTests(unittest.TestCase):
                 with patch.object(server.slack_document_inputs, "download_slack_document_files", return_value=[downloaded_document]):
                     with patch.object(server.slack_document_inputs, "cleanup_downloaded_documents"):
                         with patch.object(server.slack_document_inputs, "cleanup_download_directory"):
-                            with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+                            with patch.object(
+                                server,
+                                "run_runtime_turn_with_updates",
+                                return_value=result,
+                            ) as run_runtime_turn_with_updates:
                                 server.process_prompt(
                                     self.client,
                                     self.channel,
@@ -932,7 +1329,7 @@ class ProcessPromptTests(unittest.TestCase):
                                     slack_event_payload={"event": {"files": [{"id": "F1"}]}},
                                 )
 
-        prompt = run_codex_with_updates.call_args.args[3]
+        prompt = run_runtime_turn_with_updates.call_args.args[4]
         self.assertTrue(prompt.startswith("请总结这份文档"))
         self.assertIn("notes.md", prompt)
         self.assertIn("/tmp/notes.md", prompt)
@@ -1077,19 +1474,48 @@ class ProcessPromptTests(unittest.TestCase):
             timed_out=False,
         )
 
-        with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+        with patch.object(
+            server,
+            "run_runtime_turn_with_updates",
+            return_value=result,
+        ) as run_runtime_turn_with_updates:
             server.process_prompt(
                 self.client,
                 self.channel,
                 self.thread_ts,
                 "fresh --effort high fix the flaky test",
                 self.user_id,
-            )
+        )
 
         self.assertEqual(self.store.get_reasoning_effort(self.thread_key), "high")
         self.assertEqual(self.store.get_session_origin(self.thread_key), server.SESSION_ORIGIN_SLACK)
-        self.assertEqual(run_codex_with_updates.call_args.kwargs["reasoning_effort"], "high")
-        self.assertIsNone(run_codex_with_updates.call_args.kwargs["session_id"])
+        self.assertEqual(run_runtime_turn_with_updates.call_args.kwargs["reasoning_effort"], "high")
+        self.assertIsNone(run_runtime_turn_with_updates.call_args.kwargs["session_id"])
+
+    def test_new_slack_session_uses_runtime_path(self):
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="done",
+            exit_code=0,
+            raw_output="",
+            final_output="done",
+            json_output="",
+            cleaned_output="done",
+            timed_out=False,
+        )
+
+        with patch.object(server, "run_runtime_turn_with_updates", return_value=result) as run_runtime_turn_with_updates:
+            with patch.object(server, "run_codex_with_updates") as run_codex_with_updates:
+                server.process_prompt(
+                    self.client,
+                    self.channel,
+                    self.thread_ts,
+                    "start a brand new task",
+                    self.user_id,
+                )
+
+        run_runtime_turn_with_updates.assert_called_once()
+        run_codex_with_updates.assert_not_called()
 
     def test_attached_session_without_override_preserves_inherited_effort(self):
         self.store.set(
@@ -1113,11 +1539,43 @@ class ProcessPromptTests(unittest.TestCase):
 
         with patch.dict(server.ENV, {"CODEX_REASONING_EFFORT": "xhigh"}, clear=False):
             with patch.object(server, "read_thread_cwd", return_value="/tmp/original-project"):
-                with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+                with patch.object(
+                    server,
+                    "run_runtime_turn_with_updates",
+                    return_value=result,
+                ) as run_runtime_turn_with_updates:
                     server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
 
-        self.assertIsNone(run_codex_with_updates.call_args.kwargs["reasoning_effort"])
-        self.assertEqual(run_codex_with_updates.call_args.kwargs["workdir_override"], "/tmp/original-project")
+        self.assertIsNone(run_runtime_turn_with_updates.call_args.kwargs["reasoning_effort"])
+        self.assertEqual(run_runtime_turn_with_updates.call_args.kwargs["workdir_override"], "/tmp/original-project")
+
+    def test_controlled_existing_session_uses_runtime_path_instead_of_cli_resume(self):
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_ATTACHED,
+            session_cwd="/tmp/original-project",
+        )
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="done",
+            exit_code=0,
+            raw_output="",
+            final_output="done",
+            json_output="",
+            cleaned_output="done",
+            timed_out=False,
+        )
+
+        with patch.object(server, "read_thread_cwd", return_value="/tmp/original-project"):
+            with patch.object(server, "run_runtime_turn_with_updates", return_value=result) as run_runtime_turn_with_updates:
+                with patch.object(server, "run_codex_with_updates") as run_codex_with_updates:
+                    server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
+
+        run_runtime_turn_with_updates.assert_called_once()
+        run_codex_with_updates.assert_not_called()
 
     def test_resume_rebuild_preserves_effort_override_and_switches_origin_to_slack(self):
         original_result = server.CodexRunResult(
@@ -1153,15 +1611,15 @@ class ProcessPromptTests(unittest.TestCase):
         with patch.object(server, "read_thread_cwd", return_value="/tmp/original-project"):
             with patch.object(
                 server,
-                "run_codex_with_updates",
+                "run_runtime_turn_with_updates",
                 side_effect=[original_result, rebuilt_result],
-            ) as run_codex_with_updates:
+            ) as run_runtime_turn_with_updates:
                 server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
 
-        self.assertEqual(run_codex_with_updates.call_args_list[0].kwargs["reasoning_effort"], "high")
-        self.assertEqual(run_codex_with_updates.call_args_list[1].kwargs["reasoning_effort"], "high")
-        self.assertEqual(run_codex_with_updates.call_args_list[0].kwargs["workdir_override"], "/tmp/original-project")
-        self.assertEqual(run_codex_with_updates.call_args_list[1].kwargs["workdir_override"], "/tmp/original-project")
+        self.assertEqual(run_runtime_turn_with_updates.call_args_list[0].kwargs["reasoning_effort"], "high")
+        self.assertEqual(run_runtime_turn_with_updates.call_args_list[1].kwargs["reasoning_effort"], "high")
+        self.assertEqual(run_runtime_turn_with_updates.call_args_list[0].kwargs["workdir_override"], "/tmp/original-project")
+        self.assertEqual(run_runtime_turn_with_updates.call_args_list[1].kwargs["workdir_override"], "/tmp/original-project")
         self.assertEqual(self.store.get(self.thread_key), "019d5868-71ba-7101-9143-81867f3db5c0")
         self.assertEqual(self.store.get_reasoning_effort(self.thread_key), "high")
         self.assertEqual(self.store.get_session_origin(self.thread_key), server.SESSION_ORIGIN_SLACK)
@@ -1197,66 +1655,6 @@ class ProcessPromptTests(unittest.TestCase):
         text = self.client.messages[0]["text"]
         self.assertIn("已处于 `control` 模式", text)
         self.assertIn("为避免重复消息", text)
-
-    def test_watch_loop_incremental_push_uses_plain_dialogue_without_update_heading(self):
-        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
-        events = [
-            server.ConversationEvent("turn-0", "u0", "user", "previous"),
-            server.ConversationEvent("turn-0", "a0", "assistant", "done previous"),
-            server.ConversationEvent("turn-1", "u1", "user", "hello"),
-            server.ConversationEvent("turn-1", "a1", "assistant", "done"),
-        ]
-        calls = {"count": 0}
-
-        class FakeStopEvent:
-            def wait(self, _seconds):
-                calls["count"] += 1
-                return calls["count"] > 1
-
-        with patch.object(server, "get_watch_poll_seconds", return_value=1):
-            with patch.object(server, "read_conversation_events", return_value=events):
-                with patch.object(server, "post_chunks") as post_chunks:
-                    with patch.object(server, "get_watcher", return_value=None):
-                        server.watch_loop(
-                            self.client,
-                            self.channel,
-                            self.thread_ts,
-                            self.thread_key,
-                            self.session_id,
-                            FakeStopEvent(),
-                            last_event_key=("turn-0", "a0"),
-                        )
-
-        post_chunks.assert_called_once()
-        self.assertEqual(post_chunks.call_args.args[3], "*User*\n> hello\n\n*Codex*\n> done")
-
-    def test_watch_loop_stops_when_anchor_event_is_missing(self):
-        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
-        events = [
-            server.ConversationEvent("turn-2", "u2", "user", "next"),
-            server.ConversationEvent("turn-2", "a2", "assistant", "done"),
-        ]
-
-        class FakeStopEvent:
-            def wait(self, _seconds):
-                return False
-
-        with patch.object(server, "get_watch_poll_seconds", return_value=1):
-            with patch.object(server, "read_conversation_events", return_value=events):
-                with patch.object(server, "post_chunks") as post_chunks:
-                    with patch.object(server, "get_watcher", return_value=None):
-                        server.watch_loop(
-                            self.client,
-                            self.channel,
-                            self.thread_ts,
-                            self.thread_key,
-                            self.session_id,
-                            FakeStopEvent(),
-                            last_event_key=("missing", "key"),
-                        )
-
-        post_chunks.assert_called_once()
-        self.assertIn("请重新发送 `watch`", post_chunks.call_args.args[3])
 
     def test_observe_mode_blocks_normal_resume(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)

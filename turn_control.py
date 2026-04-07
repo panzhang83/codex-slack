@@ -89,7 +89,7 @@ def interrupt_active_turn(config: CodexAppServerConfig, session_id):
     active_turn = get_active_turn(config, session_id)
     if not active_turn:
         raise RuntimeError("当前 session 没有可中断的活跃 turn。")
-    interrupt_turn(config, active_turn.turn_id)
+    interrupt_turn(config, active_turn.thread_id, active_turn.turn_id)
     return active_turn
 
 

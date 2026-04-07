@@ -1,4 +1,5 @@
 import atexit
+import asyncio
 import json
 import os
 import queue
@@ -14,14 +15,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from app_runtime import AppServerRuntime
 import codex_threads as thread_views
 import session_catalog
 import slack_document_inputs
 import slack_home
 import slack_image_inputs
+from codex_app_server_sdk.models import ThreadConfig, TurnOverrides
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from turn_control import ActiveTurnRegistry, interrupt_active_turn, steer_active_turn
+from turn_control import ActiveTurnRegistry
 
 warnings.filterwarnings(
     "ignore",
@@ -67,6 +70,8 @@ WATCHERS_GUARD = threading.Lock()
 INSTANCE_LOCK_HANDLE = None
 SESSION_SELECTION_CACHE = session_catalog.SessionSelectionCache()
 ACTIVE_TURN_REGISTRY = ActiveTurnRegistry()
+APP_RUNTIME = None
+APP_RUNTIME_GUARD = threading.Lock()
 SESSION_MODE_OBSERVE = "observe"
 SESSION_MODE_CONTROL = "control"
 SESSION_ORIGIN_ATTACHED = "attached"
@@ -74,15 +79,18 @@ SESSION_ORIGIN_SLACK = "slack"
 DEFAULT_REASONING_EFFORT = "xhigh"
 SUPPORTED_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 DEFAULT_WATCH_POLL_SECONDS = 5
+DEFAULT_WATCH_METADATA_FALLBACK_SECONDS = 30
+DEFAULT_WATCH_FS_DEBOUNCE_SECONDS = 0.2
 DEFAULT_PROGRESS_HEARTBEAT_SECONDS = 300
 DEFAULT_PROGRESS_POLL_SECONDS = 15
+DEFAULT_PROGRESS_BATCH_SECONDS = 5.0
 MAX_APP_SERVER_RETRIES = 2
 MAX_WATCH_READ_FAILURES = 2
 DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES = 32 * 1024 * 1024
 DEFAULT_IMAGE_ONLY_PROMPT = "请查看我附上的图片，并按我的上下文继续处理。"
 DEFAULT_DOCUMENT_ONLY_PROMPT = "请先阅读我附上的文档，并按我的上下文继续处理。"
 DEFAULT_IMAGE_AND_DOCUMENT_ONLY_PROMPT = "请查看我附上的图片并阅读我附上的文档，然后按我的上下文继续处理。"
-SUPPORTED_DOCUMENT_ATTACHMENT_HINT = "txt/md/json/yaml/csv/pdf/docx 等文档类附件"
+SUPPORTED_DOCUMENT_ATTACHMENT_HINT = "txt/md/json/yaml/csv/pdf/docx/jl/ipynb 等文档类附件"
 DEFAULT_PROGRESS_UPDATES_ENABLED = True
 
 
@@ -102,6 +110,15 @@ def normalize_progress_updates(value):
     if normalized in {"off", "false", "0", "no"}:
         return False
     return None
+
+
+def format_progress_updates_value(value):
+    normalized = normalize_progress_updates(value)
+    if normalized is True:
+        return "on"
+    if normalized is False:
+        return "off"
+    return "-"
 
 
 def format_reasoning_effort_values():
@@ -150,6 +167,9 @@ class SlackThreadSessionStore:
             reasoning_effort = normalize_reasoning_effort(value.get("reasoning_effort"))
             if reasoning_effort:
                 entry["reasoning_effort"] = reasoning_effort
+            progress_updates = normalize_progress_updates(value.get("progress_updates"))
+            if progress_updates is not None:
+                entry["progress_updates"] = progress_updates
             session_origin = value.get("session_origin")
             if session_origin in {SESSION_ORIGIN_ATTACHED, SESSION_ORIGIN_SLACK}:
                 entry["session_origin"] = session_origin
@@ -186,7 +206,12 @@ class SlackThreadSessionStore:
             entry = self._sessions.get(key)
             if not entry:
                 return None
-            return entry.get("mode") or SESSION_MODE_CONTROL
+            mode = entry.get("mode")
+            if mode in {SESSION_MODE_OBSERVE, SESSION_MODE_CONTROL}:
+                return mode
+            if entry.get("session_id"):
+                return SESSION_MODE_CONTROL
+            return None
 
     def get_owner(self, key):
         with self._lock:
@@ -221,6 +246,13 @@ class SlackThreadSessionStore:
                 return None
             return normalize_session_cwd(entry.get("session_cwd"))
 
+    def get_progress_updates(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return normalize_progress_updates(entry.get("progress_updates"))
+
     def find_owner_for_session(self, session_id):
         with self._lock:
             for entry in self._sessions.values():
@@ -245,6 +277,9 @@ class SlackThreadSessionStore:
             reasoning_effort = normalize_reasoning_effort(existing_entry.get("reasoning_effort"))
             if reasoning_effort:
                 entry["reasoning_effort"] = reasoning_effort
+            progress_updates = normalize_progress_updates(existing_entry.get("progress_updates"))
+            if progress_updates is not None:
+                entry["progress_updates"] = progress_updates
             effective_session_origin = session_origin or existing_entry.get("session_origin") or SESSION_ORIGIN_SLACK
             if effective_session_origin in {SESSION_ORIGIN_ATTACHED, SESSION_ORIGIN_SLACK}:
                 entry["session_origin"] = effective_session_origin
@@ -299,6 +334,9 @@ class SlackThreadSessionStore:
             reasoning_effort = normalize_reasoning_effort(existing_entry.get("reasoning_effort"))
             if reasoning_effort:
                 entry["reasoning_effort"] = reasoning_effort
+            progress_updates = normalize_progress_updates(existing_entry.get("progress_updates"))
+            if progress_updates is not None:
+                entry["progress_updates"] = progress_updates
             effective_session_cwd = normalize_session_cwd(session_cwd) or normalize_session_cwd(
                 existing_entry.get("session_cwd")
             )
@@ -331,6 +369,36 @@ class SlackThreadSessionStore:
                 return False
             entry.pop("reasoning_effort", None)
             if entry.get("session_id"):
+                entry["updated_at"] = int(time.time())
+                self._save_locked()
+                return True
+            self._sessions.pop(key, None)
+            self._save_locked()
+            return True
+
+    def set_progress_updates(self, key, progress_updates, owner_user_id=None):
+        normalized_progress_updates = normalize_progress_updates(progress_updates)
+        if normalized_progress_updates is None:
+            return
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["progress_updates"] = normalized_progress_updates
+            existing_entry["updated_at"] = int(time.time())
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
+            if effective_owner_user_id:
+                existing_entry["owner_user_id"] = effective_owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
+
+    def clear_progress_updates(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return False
+            if "progress_updates" not in entry:
+                return False
+            entry.pop("progress_updates", None)
+            if entry.get("session_id") or entry.get("reasoning_effort") or entry.get("owner_user_id"):
                 entry["updated_at"] = int(time.time())
                 self._save_locked()
                 return True
@@ -434,6 +502,95 @@ class WatchHandle:
     session_id: str
     channel: str
     thread_ts: str
+
+
+@dataclass(frozen=True)
+class WatchThreadSnapshot:
+    path: Optional[str]
+    updated_at: Optional[int]
+    status_type: str
+
+
+class AsyncProgressReporter:
+    def __init__(self, client, channel, thread_ts, batch_seconds=None):
+        self.client = client
+        self.channel = channel
+        self.thread_ts = thread_ts
+        self.batch_seconds = max(0.5, float(batch_seconds or get_progress_batch_seconds()))
+        self._queue = queue.Queue()
+        self._closed = threading.Event()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
+    def enqueue(self, text):
+        normalized = (text or "").strip()
+        if not normalized or self._closed.is_set():
+            return
+        self._queue.put(("message", normalized, None))
+
+    def flush(self, timeout=10):
+        if self._closed.is_set():
+            return
+        marker = threading.Event()
+        self._queue.put(("flush", None, marker))
+        marker.wait(timeout=timeout)
+
+    def close(self, timeout=10):
+        if self._closed.is_set():
+            return
+        marker = threading.Event()
+        self._queue.put(("stop", None, marker))
+        marker.wait(timeout=timeout)
+        self._closed.set()
+        self._worker.join(timeout=timeout)
+
+    def _post_pending(self, pending_messages):
+        merged = "\n\n".join(message for message in pending_messages if message)
+        if merged:
+            post_chunks(self.client, self.channel, self.thread_ts, merged)
+
+    def _worker_loop(self):
+        pending_messages = []
+        deadline = None
+        while True:
+            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                command, payload, marker = self._queue.get(timeout=timeout)
+            except queue.Empty:
+                if pending_messages:
+                    try:
+                        self._post_pending(pending_messages)
+                    except Exception as exc:  # pragma: no cover
+                        print(f"[progress_reporter_error] {exc}", flush=True)
+                    pending_messages = []
+                deadline = None
+                continue
+
+            should_stop = False
+            try:
+                if command == "message":
+                    pending_messages.append(payload)
+                    if deadline is None:
+                        deadline = time.monotonic() + self.batch_seconds
+                elif command in {"flush", "stop"}:
+                    if pending_messages:
+                        self._post_pending(pending_messages)
+                        pending_messages = []
+                    deadline = None
+                    should_stop = command == "stop"
+                else:  # pragma: no cover
+                    deadline = None
+            except Exception as exc:  # pragma: no cover
+                print(f"[progress_reporter_error] {exc}", flush=True)
+                pending_messages = []
+                deadline = None
+                should_stop = command == "stop"
+            finally:
+                if marker is not None:
+                    marker.set()
+
+            if should_stop:
+                return
 
 
 ConversationEvent = thread_views.ConversationEvent
@@ -558,6 +715,14 @@ def strip_name_command(text):
     return strip_command_payload(text, "name") or ""
 
 
+def is_progress_command(text):
+    return strip_command_payload(text, "progress") is not None
+
+
+def strip_progress_command(text):
+    return strip_command_payload(text, "progress") or ""
+
+
 def is_control_command(text):
     normalized = (text or "").strip().lower()
     return normalized in {"/control", "control", "/takeover", "takeover"}
@@ -663,6 +828,15 @@ def get_codex_app_server_config():
     )
 
 
+def get_app_runtime():
+    global APP_RUNTIME
+    with APP_RUNTIME_GUARD:
+        if APP_RUNTIME is None:
+            APP_RUNTIME = AppServerRuntime(get_codex_app_server_config)
+            atexit.register(APP_RUNTIME.close)
+        return APP_RUNTIME
+
+
 def get_watch_poll_seconds():
     raw = str(ENV.get("CODEX_SLACK_WATCH_POLL_SECONDS", DEFAULT_WATCH_POLL_SECONDS)).strip()
     try:
@@ -670,6 +844,34 @@ def get_watch_poll_seconds():
     except ValueError:
         return DEFAULT_WATCH_POLL_SECONDS
     return max(1, value)
+
+
+def get_watch_metadata_fallback_seconds():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_WATCH_METADATA_FALLBACK_SECONDS",
+            DEFAULT_WATCH_METADATA_FALLBACK_SECONDS,
+        )
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_WATCH_METADATA_FALLBACK_SECONDS
+    return max(1, value)
+
+
+def get_watch_fs_debounce_seconds():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_WATCH_FS_DEBOUNCE_SECONDS",
+            DEFAULT_WATCH_FS_DEBOUNCE_SECONDS,
+        )
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_WATCH_FS_DEBOUNCE_SECONDS
+    return max(0.05, value)
 
 
 def get_progress_heartbeat_seconds():
@@ -688,6 +890,42 @@ def get_progress_poll_seconds():
     except ValueError:
         return DEFAULT_PROGRESS_POLL_SECONDS
     return max(1, value)
+
+
+def get_progress_batch_seconds():
+    raw = str(ENV.get("CODEX_PROGRESS_BATCH_SECONDS", DEFAULT_PROGRESS_BATCH_SECONDS)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_PROGRESS_BATCH_SECONDS
+    return max(0.5, value)
+
+
+def get_default_progress_updates_enabled():
+    normalized = normalize_progress_updates(ENV.get("CODEX_PROGRESS_UPDATES", DEFAULT_PROGRESS_UPDATES_ENABLED))
+    if normalized is None:
+        return DEFAULT_PROGRESS_UPDATES_ENABLED
+    return normalized
+
+
+def resolve_progress_updates(thread_key, session_store=None):
+    session_store = session_store or SESSION_STORE
+    thread_override = session_store.get_progress_updates(thread_key)
+    if thread_override is not None:
+        return thread_override, "thread"
+    return get_default_progress_updates_enabled(), "default"
+
+
+def get_progress_updates_state_lines(thread_key, session_store=None):
+    session_store = session_store or SESSION_STORE
+    thread_override = session_store.get_progress_updates(thread_key)
+    effective_value, source = resolve_progress_updates(thread_key, session_store=session_store)
+    return [
+        f"- progress_updates_effective: `{format_progress_updates_value(effective_value)}`",
+        f"- progress_updates_source: `{source}`",
+        f"- progress_updates_thread_override: `{format_progress_updates_value(thread_override)}`",
+        f"- progress_updates_default: `{format_progress_updates_value(get_default_progress_updates_enabled())}`",
+    ]
 
 
 def get_allowed_slack_user_ids():
@@ -761,7 +999,7 @@ def get_attach_error(user_id, session_id, session_store=None):
 
 def get_session_mode(thread_key, session_store=None):
     session_store = session_store or SESSION_STORE
-    return session_store.get_mode(thread_key) or SESSION_MODE_CONTROL
+    return session_store.get_mode(thread_key)
 
 
 def get_session_origin(thread_key, session_store=None):
@@ -778,8 +1016,40 @@ def extract_thread_cwd(thread_read_response):
     return thread_views.extract_thread_cwd(thread_read_response)
 
 
+def extract_thread_path(thread_read_response):
+    thread = read_field(thread_read_response, "thread", thread_read_response)
+    normalized = str(read_field(thread, "path", "") or "").strip()
+    return normalized or None
+
+
+def extract_thread_status_type(thread_read_response):
+    thread = read_field(thread_read_response, "thread", thread_read_response)
+    status = read_root(read_field(thread, "status", {}) or {})
+    normalized = str(read_field(status, "type", "") or "").strip()
+    return normalized or "unknown"
+
+
+def extract_thread_updated_at(thread_read_response):
+    thread = read_field(thread_read_response, "thread", thread_read_response)
+    updated_at = read_field(thread, "updatedAt")
+    if updated_at is None:
+        return None
+    try:
+        return int(updated_at)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_watch_thread_snapshot(thread_read_response):
+    return WatchThreadSnapshot(
+        path=extract_thread_path(thread_read_response),
+        updated_at=extract_thread_updated_at(thread_read_response),
+        status_type=extract_thread_status_type(thread_read_response),
+    )
+
+
 def read_thread_cwd(session_id):
-    return extract_thread_cwd(read_thread_response(session_id))
+    return extract_thread_cwd(read_thread_response(session_id, include_turns=False))
 
 
 def refresh_session_cwd(thread_key, session_id, owner_user_id=None, session_store=None):
@@ -935,6 +1205,74 @@ def get_reasoning_effort_reset_message(thread_key, session_id=None, session_orig
         "已清除当前 Slack thread 的 reasoning effort override。\n\n"
         f"{fallback_text}"
     )
+
+
+def parse_extra_arg_value(tokens, flag_name):
+    normalized_flag = f"--{flag_name}"
+    prefix = f"{normalized_flag}="
+    for index, token in enumerate(tokens):
+        if token == normalized_flag:
+            if index + 1 < len(tokens):
+                return tokens[index + 1]
+            return None
+        if token.startswith(prefix):
+            return token[len(prefix) :]
+    return None
+
+
+def has_extra_arg_flag(tokens, flag_name):
+    normalized_flag = f"--{flag_name}"
+    return any(token == normalized_flag for token in tokens)
+
+
+def resolve_runtime_policy_settings():
+    _codex_bin, _model, _default_workdir, _timeout, configured_sandbox, extra_args, full_auto = get_codex_settings()
+    tokens = shlex.split(extra_args) if extra_args else []
+    effective_full_auto = full_auto or has_extra_arg_flag(tokens, "full-auto")
+
+    parsed_sandbox = parse_extra_arg_value(tokens, "sandbox")
+    parsed_approval_policy = parse_extra_arg_value(tokens, "approval-policy")
+    sandbox = parsed_sandbox or configured_sandbox or None
+    approval_policy = parsed_approval_policy
+
+    if "--dangerously-bypass-approvals-and-sandbox" in tokens:
+        return "danger-full-access", "never"
+    if effective_full_auto:
+        return "workspace-write", approval_policy or "on-request"
+    return sandbox, approval_policy
+
+
+def build_runtime_thread_config(workdir_override=None):
+    _codex_bin, model, default_workdir, _timeout, _sandbox, _extra_args, _full_auto = get_codex_settings()
+    sandbox, approval_policy = resolve_runtime_policy_settings()
+    workdir = normalize_session_cwd(workdir_override) or default_workdir
+    kwargs = {"cwd": workdir}
+    if model:
+        kwargs["model"] = model
+    if sandbox:
+        kwargs["sandbox"] = sandbox
+    if approval_policy:
+        kwargs["approval_policy"] = approval_policy
+    return ThreadConfig(**kwargs)
+
+
+def build_runtime_turn_overrides(reasoning_effort=None, workdir_override=None):
+    kwargs = {}
+    workdir = normalize_session_cwd(workdir_override)
+    if workdir:
+        kwargs["cwd"] = workdir
+    if reasoning_effort:
+        kwargs["effort"] = reasoning_effort
+    if not kwargs:
+        return None
+    return TurnOverrides(**kwargs)
+
+
+def build_runtime_input_items(prompt, image_paths=None):
+    items = [{"type": "text", "text": prompt}]
+    for image_path in image_paths or []:
+        items.append({"type": "localImage", "path": str(image_path)})
+    return items
 
 
 def build_codex_exec_args(
@@ -1494,11 +1832,18 @@ def create_app_server_client():
 
 
 async def read_thread_response_async(session_id):
-    return await thread_views.read_thread_response_async(get_codex_app_server_config(), session_id)
+    return await thread_views.read_thread_response_async(
+        get_codex_app_server_config(),
+        session_id,
+    )
 
 
-def read_thread_response(session_id):
-    return thread_views.read_thread_response(get_codex_app_server_config(), session_id)
+def read_thread_response(session_id, include_turns=True):
+    return thread_views.read_thread_response(
+        get_codex_app_server_config(),
+        session_id,
+        include_turns=include_turns,
+    )
 
 
 def format_user_input(user_input):
@@ -1556,6 +1901,21 @@ def build_watch_bootstrap(session_id):
     return format_conversation_events(bootstrap_events, heading="最近一轮对话:"), last_event_key
 
 
+def advance_watch_cursor(events, last_event_key):
+    try:
+        new_events = get_events_after_key(events, last_event_key)
+    except WatchAnchorLostError:
+        rebased_events = get_latest_completed_turn_events(events) or get_recent_turn_events(events)
+        new_last_event_key = get_event_key(rebased_events[-1]) if rebased_events else None
+        return None, new_last_event_key, True
+
+    if not new_events:
+        return None, last_event_key, False
+
+    new_last_event_key = get_event_key(new_events[-1])
+    return format_conversation_events(new_events), new_last_event_key, False
+
+
 def capture_progress_baseline(session_id):
     try:
         progress_events = extract_progress_events(read_thread_response(session_id))
@@ -1580,6 +1940,142 @@ def maybe_post_progress_updates(client, channel, thread_ts, session_id, previous
 
     for message in build_progress_messages(progress_events, previous_text_by_item_id):
         post_chunks(client, channel, thread_ts, message)
+
+
+def create_progress_reporter(client, channel, thread_ts, batch_seconds=None):
+    return AsyncProgressReporter(
+        client,
+        channel,
+        thread_ts,
+        batch_seconds=batch_seconds,
+    )
+
+
+def get_runtime_active_turn(session_id):
+    if not session_id:
+        return None
+    return get_app_runtime().get_active_turn(session_id)
+
+
+def get_effective_session_mode(thread_key, session_id=None, session_mode=None, active_record=None):
+    normalized_mode = session_mode if session_mode in {SESSION_MODE_OBSERVE, SESSION_MODE_CONTROL} else None
+    if normalized_mode:
+        return normalized_mode
+    effective_active_record = active_record if active_record is not None else ACTIVE_TURN_REGISTRY.get_for_thread(thread_key)
+    effective_session_id = session_id or (effective_active_record.session_id if effective_active_record else None)
+    if effective_session_id and effective_active_record and effective_active_record.session_id == effective_session_id:
+        return SESSION_MODE_CONTROL
+    return None
+
+
+def build_runtime_turn_unavailable_message(current_session_id):
+    session_hint = f"session `{current_session_id}`" if current_session_id else "当前 session"
+    return (
+        f"{session_hint} 当前没有由 codex-slack runtime 持有的活跃 turn。"
+        " 终端里已经在运行的 turn 目前只能 `watch`；等它结束后，再发送普通消息让 Slack 接管后续 turn。"
+    )
+
+
+def run_runtime_turn_with_updates(
+    client,
+    channel,
+    thread_ts,
+    thread_key,
+    prompt,
+    session_id=None,
+    enable_progress=False,
+    reasoning_effort=None,
+    workdir_override=None,
+    image_paths=None,
+    owner_user_id=None,
+    session_origin=SESSION_ORIGIN_SLACK,
+):
+    runtime = get_app_runtime()
+    session_id_tracker = SessionIdTracker(session_id=session_id)
+    heartbeat_seconds = get_progress_heartbeat_seconds() if enable_progress else None
+    progress_state = {"baseline": {}}
+    progress_reporter = create_progress_reporter(client, channel, thread_ts) if enable_progress else None
+
+    def on_turn_started(started_session_id, turn_id):
+        session_id_tracker.set(started_session_id)
+        ACTIVE_TURN_REGISTRY.set(thread_key, started_session_id, turn_id)
+        SESSION_STORE.set(
+            thread_key,
+            started_session_id,
+            owner_user_id=owner_user_id,
+            session_origin=session_origin,
+            session_cwd=workdir_override,
+        )
+    def on_step(step):
+        if not enable_progress or not step.text or step.item_type != "agentMessage":
+            return
+        item = step.data.get("item") if isinstance(step.data, dict) else None
+        phase = item.get("phase") if isinstance(item, dict) else None
+        if not is_progress_phase(phase):
+            return
+        event = ProgressEvent(
+            turn_id=step.turn_id,
+            item_id=step.item_id or f"{step.turn_id}:progress",
+            phase=str(phase),
+            text=step.text,
+        )
+        for message in build_progress_messages([event], progress_state["baseline"]):
+            progress_reporter.enqueue(message)
+
+    def on_heartbeat(current_session_id, _turn_id, elapsed_seconds):
+        if not progress_reporter:
+            return
+        progress_reporter.enqueue(
+            f"仍在运行，已持续 {format_elapsed_seconds(elapsed_seconds)}。"
+            f" session `{current_session_id}`"
+        )
+
+    try:
+        runtime_result = runtime.run_turn(
+            session_id=session_id,
+            input_items=build_runtime_input_items(prompt, image_paths=image_paths),
+            thread_config=build_runtime_thread_config(workdir_override=workdir_override),
+            turn_overrides=build_runtime_turn_overrides(
+                reasoning_effort=reasoning_effort,
+                workdir_override=workdir_override,
+            ),
+            heartbeat_seconds=heartbeat_seconds,
+            on_turn_started=on_turn_started,
+            on_step=on_step,
+            on_heartbeat=on_heartbeat,
+        )
+    except Exception as exc:
+        if session_id and is_invalid_session_result(str(exc)):
+            message = str(exc)
+            return CodexRunResult(
+                session_id=session_id_tracker.get() or session_id,
+                text=message,
+                exit_code=1,
+                raw_output=message,
+                final_output="",
+                json_output="",
+                cleaned_output=message,
+                timed_out=False,
+            )
+        raise
+    finally:
+        ACTIVE_TURN_REGISTRY.clear_for_thread(thread_key)
+        if progress_reporter:
+            progress_reporter.flush()
+            progress_reporter.close()
+
+    final_text = (runtime_result.final_text or "").strip() or "Codex finished without returning text."
+    raw_output = "\n\n".join(step.text for step in runtime_result.steps if step.text).strip()
+    return CodexRunResult(
+        session_id=session_id_tracker.get() or runtime_result.session_id,
+        text=final_text,
+        exit_code=0,
+        raw_output=raw_output,
+        final_output=final_text,
+        json_output="",
+        cleaned_output=final_text,
+        timed_out=False,
+    )
 
 
 def run_codex_with_updates(
@@ -1689,18 +2185,156 @@ def stop_watcher(thread_key):
     return True
 
 
-def watch_loop(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key=None):
+async def _read_thread_response_with_client(client, session_id, *, include_turns):
+    return await client.read_thread(session_id, include_turns=include_turns)
+
+
+def _watch_transport_error_message(notification):
+    if not isinstance(notification, dict):
+        return None
+    if notification.get("method") != "__transport_error__":
+        return None
+    params = notification.get("params")
+    if not isinstance(params, dict):
+        return "receiver loop failed"
+    message = str(params.get("message") or "").strip()
+    return message or "receiver loop failed"
+
+
+def _parse_fs_watch_response(response):
+    if not isinstance(response, dict):
+        return None, None
+    watch_id = str(response.get("watchId") or "").strip()
+    path = str(response.get("path") or "").strip()
+    return watch_id or None, path or None
+
+
+async def _start_fs_watch(client, path):
+    response = await client.request("fs/watch", {"path": path})
+    return _parse_fs_watch_response(response)
+
+
+async def _stop_fs_watch(client, watch_id):
+    if not watch_id:
+        return
+    with suppress(Exception):
+        await client.request("fs/unwatch", {"watchId": watch_id})
+
+
+async def _drain_fs_changed_notifications(client, watch_id, debounce_seconds):
+    deadline = time.monotonic() + max(0.05, debounce_seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            notification = await asyncio.wait_for(client._notifications.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return
+
+        error_message = _watch_transport_error_message(notification)
+        if error_message:
+            raise RuntimeError(f"watch transport failed: {error_message}")
+
+        if not isinstance(notification, dict):
+            continue
+        if notification.get("method") != "fs/changed":
+            continue
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            continue
+        if str(params.get("watchId") or "").strip() != watch_id:
+            continue
+        deadline = time.monotonic() + max(0.05, debounce_seconds)
+
+
+async def _wait_for_watch_signal(client, watch_id, stop_event, timeout_seconds, debounce_seconds):
+    wait_timeout = max(0.1, float(timeout_seconds))
+    while not stop_event.is_set():
+        if not watch_id:
+            await asyncio.to_thread(stop_event.wait, wait_timeout)
+            return "poll"
+
+        try:
+            notification = await asyncio.wait_for(client._notifications.get(), timeout=wait_timeout)
+        except asyncio.TimeoutError:
+            return "poll"
+
+        error_message = _watch_transport_error_message(notification)
+        if error_message:
+            raise RuntimeError(f"watch transport failed: {error_message}")
+
+        if not isinstance(notification, dict):
+            continue
+        if notification.get("method") != "fs/changed":
+            continue
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            continue
+        if str(params.get("watchId") or "").strip() != watch_id:
+            continue
+
+        await _drain_fs_changed_notifications(client, watch_id, debounce_seconds)
+        return "fs_changed"
+
+    return "stopped"
+
+
+async def watch_loop_async(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key=None):
     failure_count = 0
     current_last_event_key = last_event_key
     poll_seconds = get_watch_poll_seconds()
+    metadata_fallback_seconds = get_watch_metadata_fallback_seconds()
+    debounce_seconds = get_watch_fs_debounce_seconds()
+    watch_client = create_app_server_client()
+    watch_id = None
+    last_snapshot = None
 
     try:
-        while not stop_event.wait(poll_seconds):
+        await watch_client.start()
+        await watch_client.initialize()
+
+        metadata_response = await _read_thread_response_with_client(
+            watch_client,
+            session_id,
+            include_turns=False,
+        )
+        last_snapshot = extract_watch_thread_snapshot(metadata_response)
+        if last_snapshot.path:
+            try:
+                watch_id, watched_path = await _start_fs_watch(watch_client, last_snapshot.path)
+                if watched_path:
+                    last_snapshot = WatchThreadSnapshot(
+                        path=watched_path,
+                        updated_at=last_snapshot.updated_at,
+                        status_type=last_snapshot.status_type,
+                    )
+            except Exception:
+                watch_id = None
+
+        while not stop_event.is_set():
+            if SESSION_STORE.get(thread_key) != session_id:
+                break
+
+            timeout_seconds = metadata_fallback_seconds if watch_id else poll_seconds
+            signal = await _wait_for_watch_signal(
+                watch_client,
+                watch_id,
+                stop_event,
+                timeout_seconds,
+                debounce_seconds,
+            )
+            if signal == "stopped":
+                break
             if SESSION_STORE.get(thread_key) != session_id:
                 break
 
             try:
-                events = read_conversation_events(session_id)
+                metadata_response = await _read_thread_response_with_client(
+                    watch_client,
+                    session_id,
+                    include_turns=False,
+                )
                 failure_count = 0
             except Exception as exc:
                 failure_count += 1
@@ -1714,21 +2348,74 @@ def watch_loop(client, channel, thread_ts, thread_key, session_id, stop_event, l
                     break
                 continue
 
-            try:
-                new_events = get_events_after_key(events, current_last_event_key)
-            except WatchAnchorLostError:
-                post_chunks(
-                    client,
-                    channel,
-                    thread_ts,
-                    "持续 watch 已停止：当前 thread 对话锚点已经失效。请重新发送 `watch` 重新建立镜像。",
-                )
-                break
-            if not new_events:
+            snapshot = extract_watch_thread_snapshot(metadata_response)
+            path_changed = snapshot.path != (last_snapshot.path if last_snapshot else None)
+            updated = snapshot.updated_at != (last_snapshot.updated_at if last_snapshot else None)
+            status_changed = snapshot.status_type != (last_snapshot.status_type if last_snapshot else None)
+
+            if path_changed:
+                await _stop_fs_watch(watch_client, watch_id)
+                watch_id = None
+                if snapshot.path:
+                    try:
+                        watch_id, watched_path = await _start_fs_watch(watch_client, snapshot.path)
+                        if watched_path:
+                            snapshot = WatchThreadSnapshot(
+                                path=watched_path,
+                                updated_at=snapshot.updated_at,
+                                status_type=snapshot.status_type,
+                            )
+                    except Exception:
+                        watch_id = None
+
+            if not (updated or status_changed or path_changed or signal == "fs_changed"):
+                last_snapshot = snapshot
                 continue
 
-            current_last_event_key = get_event_key(new_events[-1])
-            post_chunks(client, channel, thread_ts, format_conversation_events(new_events))
+            try:
+                thread_response = await _read_thread_response_with_client(
+                    watch_client,
+                    session_id,
+                    include_turns=True,
+                )
+                failure_count = 0
+            except Exception as exc:
+                failure_count += 1
+                if failure_count >= MAX_WATCH_READ_FAILURES:
+                    post_chunks(
+                        client,
+                        channel,
+                        thread_ts,
+                        f"持续 watch 已停止：读取当前 thread 对话失败。\n\n{exc}",
+                    )
+                    break
+                continue
+
+            events = extract_conversation_events(thread_response)
+            message, current_last_event_key, _rebased = advance_watch_cursor(events, current_last_event_key)
+            last_snapshot = snapshot
+            if not message:
+                continue
+            post_chunks(client, channel, thread_ts, message)
+    finally:
+        await _stop_fs_watch(watch_client, watch_id)
+        with suppress(Exception):
+            await watch_client.close()
+
+
+def watch_loop(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key=None):
+    try:
+        asyncio.run(
+            watch_loop_async(
+                client,
+                channel,
+                thread_ts,
+                thread_key,
+                session_id,
+                stop_event,
+                last_event_key=last_event_key,
+            )
+        )
     finally:
         watcher = get_watcher(thread_key)
         if watcher and watcher.stop_event is stop_event:
@@ -1754,6 +2441,122 @@ def start_watcher(client, channel, thread_ts, thread_key, session_id, last_event
         WATCHERS[thread_key] = watcher
         thread.start()
     return watcher
+
+
+def maybe_handle_live_turn_control_command(client, channel, thread_ts, thread_key, prompt, user_id):
+    if not (is_interrupt_command(prompt) or is_steer_command(prompt)):
+        return False
+
+    owner_error = get_thread_owner_access_error(thread_key, user_id)
+    if owner_error:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=owner_error)
+        return True
+
+    active_record = ACTIVE_TURN_REGISTRY.get_for_thread(thread_key)
+    current_session_id = SESSION_STORE.get(thread_key) or (active_record.session_id if active_record else None)
+    current_session_mode = get_effective_session_mode(
+        thread_key,
+        session_id=current_session_id,
+        session_mode=get_session_mode(thread_key),
+        active_record=active_record,
+    )
+
+    if is_interrupt_command(prompt):
+        if not current_session_id:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法中断 turn。",
+            )
+            return True
+
+        runtime = get_app_runtime()
+        active_turn = runtime.get_active_turn(current_session_id)
+        if not active_turn:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f"<@{user_id}> {build_runtime_turn_unavailable_message(current_session_id)}",
+            )
+            return True
+
+        try:
+            active_turn = runtime.interrupt_active_turn(active_turn)
+        except Exception as exc:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f"<@{user_id}> 中断当前 turn 失败。\n\n{exc}",
+            )
+            return True
+
+        ACTIVE_TURN_REGISTRY.set(thread_key, current_session_id, active_turn.turn_id)
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=(
+                f"<@{user_id}> 已发送中断请求：session `{current_session_id}` 的活跃 turn `{active_turn.turn_id}`。"
+                " 请等几秒后再用 `status` 确认状态。"
+            ),
+        )
+        return True
+
+    steer_payload = strip_steer_command(prompt)
+    if not current_session_id:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法 steer。",
+        )
+        return True
+    if current_session_mode != SESSION_MODE_CONTROL:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=(
+                get_observe_mode_error(user_id, current_session_id)
+                + "\n\n`steer` 只在 `control` 模式下可用。"
+            ),
+        )
+        return True
+    if not steer_payload:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"<@{user_id}> 用法：`steer <你要追加给正在运行 turn 的指令>`。",
+        )
+        return True
+
+    runtime = get_app_runtime()
+    active_turn = runtime.get_active_turn(current_session_id)
+    if not active_turn:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"<@{user_id}> {build_runtime_turn_unavailable_message(current_session_id)}",
+        )
+        return True
+
+    try:
+        active_turn = runtime.steer_active_turn(active_turn, steer_payload)
+    except Exception as exc:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f"<@{user_id}> steer 失败。\n\n{exc}",
+        )
+        return True
+
+    ACTIVE_TURN_REGISTRY.set(thread_key, current_session_id, active_turn.turn_id)
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=(
+            f"<@{user_id}> 已向 session `{current_session_id}` 的活跃 turn `{active_turn.turn_id}` "
+            f"追加输入：`{truncate_text(steer_payload, max_length=120)}`"
+        ),
+    )
+    return True
 
 
 def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payload=None):
@@ -1792,6 +2595,16 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
             )
             return
 
+        if maybe_handle_live_turn_control_command(
+            client,
+            channel,
+            thread_ts,
+            thread_key,
+            prompt,
+            user_id,
+        ):
+            return
+
         lock = claim_thread_lock(thread_key)
         try:
             with lock:
@@ -1801,7 +2614,11 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     return
 
                 current_session_id = SESSION_STORE.get(thread_key)
-                current_session_mode = get_session_mode(thread_key)
+                current_session_mode = get_effective_session_mode(
+                    thread_key,
+                    session_id=current_session_id,
+                    session_mode=get_session_mode(thread_key),
+                )
                 current_session_origin = get_session_origin(thread_key)
                 current_session_cwd = get_session_cwd(thread_key)
 
@@ -1873,6 +2690,61 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     )
                     return
 
+                if is_progress_command(prompt):
+                    progress_payload = strip_progress_command(prompt).lower()
+
+                    if not progress_payload or progress_payload == "status":
+                        lines = [f"<@{user_id}> 当前 Slack thread 的 progress 推送状态:\n"]
+                        lines.extend(get_progress_updates_state_lines(thread_key))
+                        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="\n".join(lines))
+                        return
+
+                    if progress_payload == "reset":
+                        if not SESSION_STORE.clear_progress_updates(thread_key):
+                            client.chat_postMessage(
+                                channel=channel,
+                                thread_ts=thread_ts,
+                                text=f"<@{user_id}> 当前 Slack thread 还没有显式的 progress 设置覆盖。",
+                            )
+                            return
+                        effective_value, source = resolve_progress_updates(thread_key)
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=(
+                                f"<@{user_id}> 已清除当前 Slack thread 的 progress 设置覆盖。"
+                                f" 现在生效的是 `{format_progress_updates_value(effective_value)}`（来源：`{source}`）。"
+                            ),
+                        )
+                        return
+
+                    desired_progress_updates = normalize_progress_updates(progress_payload)
+                    if desired_progress_updates is None:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=(
+                                f"<@{user_id}> `progress` 只支持 `on`、`off`、`reset`、`status`。"
+                                " 例如 `progress off`。"
+                            ),
+                        )
+                        return
+
+                    SESSION_STORE.set_progress_updates(
+                        thread_key,
+                        desired_progress_updates,
+                        owner_user_id=user_id,
+                    )
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f"<@{user_id}> 已将当前 Slack thread 的 progress 推送设置为 "
+                            f"`{format_progress_updates_value(desired_progress_updates)}`。"
+                        ),
+                    )
+                    return
+
                 if is_handoff_command(prompt):
                     if not current_session_id:
                         client.chat_postMessage(
@@ -1914,15 +2786,18 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         session_origin=current_session_origin,
                     )
                     with session_execution_guard(current_session_id):
-                        codex_result = run_codex_with_updates(
+                        codex_result = run_runtime_turn_with_updates(
                             client,
                             channel,
                             thread_ts,
+                            thread_key,
                             build_handoff_prompt(),
                             session_id=current_session_id,
                             enable_progress=False,
                             reasoning_effort=reasoning_effort,
                             workdir_override=workdir,
+                            owner_user_id=user_id,
+                            session_origin=current_session_origin or SESSION_ORIGIN_SLACK,
                         )
                     next_session_id = codex_result.session_id
                     result = append_handoff_footer(codex_result.text, next_session_id or current_session_id, workdir)
@@ -1993,15 +2868,18 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         session_cwd=workdir,
                     )
                     with session_execution_guard(current_session_id):
-                        codex_result = run_codex_with_updates(
+                        codex_result = run_runtime_turn_with_updates(
                             client,
                             channel,
                             thread_ts,
+                            thread_key,
                             build_recap_prompt(),
                             session_id=current_session_id,
                             enable_progress=False,
                             reasoning_effort=reasoning_effort,
                             workdir_override=workdir,
+                            owner_user_id=user_id,
+                            session_origin=current_session_origin or SESSION_ORIGIN_SLACK,
                         )
                     next_session_id = codex_result.session_id
                     result = append_recap_footer(codex_result.text, next_session_id or current_session_id)
@@ -2125,80 +3003,6 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     )
                     return
 
-                if is_interrupt_command(prompt):
-                    if not current_session_id:
-                        client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法中断 turn。",
-                        )
-                        return
-                    try:
-                        active_turn = interrupt_active_turn(get_codex_app_server_config(), current_session_id)
-                    except Exception as exc:
-                        client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=f"<@{user_id}> 中断当前 turn 失败。\n\n{exc}",
-                        )
-                        return
-                    ACTIVE_TURN_REGISTRY.set(thread_key, current_session_id, active_turn.turn_id)
-                    client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        text=(
-                            f"<@{user_id}> 已发送中断请求：session `{current_session_id}` 的活跃 turn `{active_turn.turn_id}`。"
-                            " 请等几秒后再用 `status` 确认状态。"
-                        ),
-                    )
-                    return
-
-                if is_steer_command(prompt):
-                    steer_payload = strip_steer_command(prompt)
-                    if not current_session_id:
-                        client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法 steer。",
-                        )
-                        return
-                    if current_session_mode != SESSION_MODE_CONTROL:
-                        client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=(
-                                get_observe_mode_error(user_id, current_session_id)
-                                + "\n\n`steer` 只在 `control` 模式下可用。"
-                            ),
-                        )
-                        return
-                    if not steer_payload:
-                        client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=f"<@{user_id}> 用法：`steer <你要追加给正在运行 turn 的指令>`。",
-                        )
-                        return
-                    try:
-                        active_turn = steer_active_turn(get_codex_app_server_config(), current_session_id, steer_payload)
-                    except Exception as exc:
-                        client.chat_postMessage(
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            text=f"<@{user_id}> steer 失败。\n\n{exc}",
-                        )
-                        return
-                    ACTIVE_TURN_REGISTRY.set(thread_key, current_session_id, active_turn.turn_id)
-                    client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        text=(
-                            f"<@{user_id}> 已向 session `{current_session_id}` 的活跃 turn `{active_turn.turn_id}` "
-                            f"追加输入：`{truncate_text(steer_payload, max_length=120)}`"
-                        ),
-                    )
-                    return
-
                 if is_unsupported_watch_command(prompt):
                     client.chat_postMessage(
                         channel=channel,
@@ -2317,6 +3121,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                 if is_status_command(prompt):
                     codex_bin, model, default_workdir, timeout, sandbox, _extra_args, _full_auto = get_codex_settings()
                     watch_active = "yes" if get_watcher(thread_key) else "no"
+                    runtime_active_turn = get_runtime_active_turn(current_session_id)
+                    runtime_turn_id = runtime_active_turn.turn_id if runtime_active_turn else "-"
                     effective_workdir = resolve_workdir(
                         thread_key,
                         session_id=current_session_id,
@@ -2327,6 +3133,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         session_id=current_session_id,
                         session_origin=current_session_origin,
                     )
+                    progress_lines = get_progress_updates_state_lines(thread_key)
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
@@ -2336,6 +3143,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             f"- session_id: `{current_session_id or '-'}`\n"
                             f"- session_mode: `{current_session_mode if current_session_id else '-'}`\n"
                             f"- session_origin: `{current_session_origin or '-'}`\n"
+                            f"- runtime_active_turn: `{runtime_turn_id}`\n"
                             f"- model: `{model}`\n"
                             f"- workdir: `{effective_workdir}`\n"
                             f"- default_workdir: `{default_workdir}`\n"
@@ -2345,6 +3153,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             f"- codex_bin: `{codex_bin}`\n"
                             f"- watch_active: `{watch_active}`\n"
                             + "\n".join(reasoning_lines)
+                            + "\n"
+                            + "\n".join(progress_lines)
                             + "\n"
                             "如果你想让终端继续同一个会话，可以在终端里使用这个 `session_id` 执行 `codex exec resume ...`。"
                         ),
@@ -2475,6 +3285,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     SESSION_STORE.set_reasoning_effort(thread_key, fresh_reasoning_effort, owner_user_id=user_id)
 
                 existing_session_id = None if force_fresh else current_session_id
+                use_runtime_control = existing_session_id is None or current_session_mode == SESSION_MODE_CONTROL
                 if existing_session_id and current_session_mode != SESSION_MODE_CONTROL:
                     client.chat_postMessage(
                         channel=channel,
@@ -2518,6 +3329,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     session_id=existing_session_id,
                     session_origin=run_session_origin,
                 )
+                progress_updates_enabled, _progress_updates_source = resolve_progress_updates(thread_key)
                 image_paths = []
                 image_download_dir = None
                 downloaded_documents = []
@@ -2561,17 +3373,33 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
 
                 try:
                     with session_execution_guard(existing_session_id):
-                        codex_result = run_codex_with_updates(
-                            client,
-                            channel,
-                            thread_ts,
-                            effective_prompt,
-                            session_id=existing_session_id,
-                            enable_progress=True,
-                            reasoning_effort=reasoning_effort,
-                            workdir_override=run_workdir,
-                            image_paths=image_paths,
-                        )
+                        if use_runtime_control:
+                            codex_result = run_runtime_turn_with_updates(
+                                client,
+                                channel,
+                                thread_ts,
+                                thread_key,
+                                effective_prompt,
+                                session_id=existing_session_id,
+                                enable_progress=progress_updates_enabled,
+                                reasoning_effort=reasoning_effort,
+                                workdir_override=run_workdir,
+                                image_paths=image_paths,
+                                owner_user_id=user_id,
+                                session_origin=run_session_origin,
+                            )
+                        else:
+                            codex_result = run_codex_with_updates(
+                                client,
+                                channel,
+                                thread_ts,
+                                effective_prompt,
+                                session_id=existing_session_id,
+                                enable_progress=progress_updates_enabled,
+                                reasoning_effort=reasoning_effort,
+                                workdir_override=run_workdir,
+                                image_paths=image_paths,
+                            )
                         next_session_id = codex_result.session_id
                         result = codex_result.text
                         print(
@@ -2597,16 +3425,31 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                                 session_id=None,
                                 session_origin=SESSION_ORIGIN_SLACK,
                             )
-                            codex_result = run_codex_with_updates(
-                                client,
-                                channel,
-                                thread_ts,
-                                effective_prompt,
-                                enable_progress=True,
-                                reasoning_effort=rebuilt_reasoning_effort,
-                                workdir_override=run_workdir,
-                                image_paths=image_paths,
-                            )
+                            if use_runtime_control:
+                                codex_result = run_runtime_turn_with_updates(
+                                    client,
+                                    channel,
+                                    thread_ts,
+                                    thread_key,
+                                    effective_prompt,
+                                    enable_progress=progress_updates_enabled,
+                                    reasoning_effort=rebuilt_reasoning_effort,
+                                    workdir_override=run_workdir,
+                                    image_paths=image_paths,
+                                    owner_user_id=user_id,
+                                    session_origin=SESSION_ORIGIN_SLACK,
+                                )
+                            else:
+                                codex_result = run_codex_with_updates(
+                                    client,
+                                    channel,
+                                    thread_ts,
+                                    effective_prompt,
+                                    enable_progress=progress_updates_enabled,
+                                    reasoning_effort=rebuilt_reasoning_effort,
+                                    workdir_override=run_workdir,
+                                    image_paths=image_paths,
+                                )
                             next_session_id = codex_result.session_id
                             result = codex_result.text
                             run_session_origin = SESSION_ORIGIN_SLACK
@@ -2762,7 +3605,7 @@ def get_thread_display_title(session_id):
     if not session_id:
         return None
     with suppress(Exception):
-        thread_response = read_thread_response(session_id)
+        thread_response = read_thread_response(session_id, include_turns=False)
         thread = read_field(thread_response, "thread", thread_response)
         title = str(read_field(thread, "name", "") or "").strip()
         if title:
@@ -2936,7 +3779,7 @@ def build_app():
             return
         initial_title = ""
         with suppress(Exception):
-            thread_response = read_thread_response(session_id)
+            thread_response = read_thread_response(session_id, include_turns=False)
             thread = read_field(thread_response, "thread", thread_response)
             initial_title = read_field(thread, "name", "") or ""
         trigger_id = body.get("trigger_id", "")

@@ -3,8 +3,8 @@
 一个面向本机 Codex CLI 的最小 Slack 桥接服务：
 
 - Slack 通过 Socket Mode 把消息推给本机 `server.py`
-- `server.py` 用本机 `codex exec --json` 流式调用 Codex CLI
-- `watch` 会把当前 Codex session 的 thread 对话同步到 Slack，方便在手机端旁路观察
+- `server.py` 会通过官方 `codex-app-server-sdk` 运行由 Slack 接管的 turn，并用官方 thread 视图做 `watch`
+- `watch` 会在对话发生变化时把当前 Codex session 的 thread 对话同步到 Slack，方便在手机端旁路观察
 
 ## 当前能力
 
@@ -17,9 +17,10 @@
 - `attach` 后默认进入 `observe` 模式，避免和终端里的交互式 Codex 并发写入
 - 只有切到 `control` / `takeover` 模式后，Slack 普通消息才会继续 `resume` 当前 session
 - 支持把 Slack 消息里的图片附件和文档类附件传给 Codex
-- `watch` 会先回放最近一轮已完成的可显示对话，然后持续推送后续新增的用户消息和 `final_answer`
+- `watch` 会先回放最近一轮已完成的可显示对话，然后在 thread 对话发生变化时持续推送后续新增的用户消息和 `final_answer`
 - `name <title>` 可重命名当前 session
-- `interrupt` / `steer <text>` 可控制当前活跃 turn
+- `interrupt` / `steer <text>` 可控制当前由 `codex-slack` 接管并持有的活跃 turn
+- 默认会推送自然语言中间 `Codex Progress`，并做短时间节流合并；可按 Slack thread 用 `progress on|off|reset|status` 控制
 - 支持按 Slack thread 设置 reasoning effort：`effort <level>`、`effort reset`、`fresh --effort <level> ...`
 - App Home 会显示默认配置、你自己的 Slack thread 绑定和最近 sessions
 - App Home 里的 binding 行支持 `Rename`，可直接改当前绑定 session 的标题
@@ -67,8 +68,10 @@ CODEX_FULL_AUTO=0
 CODEX_EXTRA_ARGS=
 CODEX_SLACK_SESSION_STORE=/path/to/codex-slack/.codex-slack-sessions.json
 CODEX_SLACK_WATCH_POLL_SECONDS=5
+CODEX_PROGRESS_UPDATES=1
 CODEX_PROGRESS_HEARTBEAT_SECONDS=300
 CODEX_PROGRESS_POLL_SECONDS=15
+CODEX_PROGRESS_BATCH_SECONDS=5
 # CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES=33554432
 ```
 
@@ -88,8 +91,10 @@ CODEX_PROGRESS_POLL_SECONDS=15
 - `attach` 一个已有 session 时，不会自动改动那个 session 原本的 effort；只有显式执行 `effort ...` 或 `fresh --effort ...` 才会覆盖
 - 当前不支持 `auto`、`none`、`minimal` 之类的 effort 值
 - `CODEX_SLACK_WATCH_POLL_SECONDS` 控制持续 watch 的轮询间隔，默认 5 秒
+- `CODEX_PROGRESS_UPDATES=1` 表示默认开启中间 `Codex Progress` 推送；设为 `0` 则默认关闭
 - `CODEX_PROGRESS_HEARTBEAT_SECONDS` 控制长任务 heartbeat 间隔，默认 300 秒
 - `CODEX_PROGRESS_POLL_SECONDS` 控制长任务 progress 轮询间隔，默认 15 秒
+- `CODEX_PROGRESS_BATCH_SECONDS` 控制 progress 在发往 Slack 前的短时间合并窗口，默认 5 秒
 - `CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES` 可选，用于在 thread 很长时提高 app-server `thread/read` 的 stdio 行缓冲上限
 - 系统环境变量优先级高于 `.env`
 
@@ -190,6 +195,9 @@ python3 server.py
 - `unwatch` / `stop watch`：停止持续 watch
 - `control` / `takeover`：切到 `control` 模式，允许 Slack 普通消息继续 `resume`；如果当前 thread 上有 `watch`，会自动停止以避免重复消息
 - `observe` / `release`：切回 `observe` 模式
+- `progress` / `progress status`：查看当前 Slack thread 的中间 progress 推送状态
+- `progress on` / `progress off`：开启或关闭当前 Slack thread 的中间 progress 推送
+- `progress reset`：清除当前 Slack thread 的 progress 覆盖，回退到 `.env` 默认值
 - `interrupt`：向当前 session 的活跃 turn 发送中断请求
 - `steer <text>`：向当前 session 的活跃 turn 追加一条指令；只在 `control` 模式下可用
 - `handoff`：基于当前 session 生成一份简短交接说明
@@ -243,13 +251,18 @@ watch
 - 绑定后默认是 `observe` 模式，适合“终端主控，手机旁路观察”
 - 如果服务识别到了该 session 的工作目录，那么之后 Slack `control` / `takeover` 时会继续沿用这个目录
 - `watch` 只显示 thread 对话里的用户消息和 agent `final_answer`
+- 对于只是 `attach` 进来的终端活跃 turn，`watch` 是旁路镜像，不会直接改写终端那一轮
 - 当前 Slack thread 处于 `control` 模式时，不再启动 `watch`；因为后续回复本来就会直接发到这个 thread，继续镜像只会造成重复消息
 - `watch` 首次会回放最近一轮已完成的可显示对话；如果当前最新 turn 还没出 `final_answer`，会等后续增量推送
+- `watch` 会尽量只在 thread 实际发生变化时刷新镜像，而不是持续重发整段历史
 - 后续只推送新出现的用户消息和 agent `final_answer`
-- 对于 `control` 模式下的长任务，服务会在运行期间定时发送 heartbeat；一旦服务拿到当前 session id，就会基于官方 thread turns 推送一部分中间 progress 更新
+- 对于 `control` 模式下的长任务，服务会在运行期间定时发送 heartbeat；默认也会推送自然语言中间 `Codex Progress`
+- 多条相邻的 progress 会在短时间窗口内自动合并，减少 Slack 消息噪音和明显卡顿
+- 这些 progress 默认开启；如果你只想看最终结果，可以在当前 Slack thread 里发送 `progress off`
+- 之后如果想恢复默认行为，发送 `progress on`；如果想回退到 `.env` 里的默认值，发送 `progress reset`
 - 为了和普通说明消息区分，镜像对话会用 `*User*` / `*Codex*` 标题加引用块样式发送到 Slack
 - 如果 `server.py` 重启了，session 绑定仍然保留，但正在运行的 `watch` 不会自动恢复；需要你在同一个 Slack thread 里重新发一次 `watch`
-- 如果 `watch` 因为读取失败或对话锚点失效而停止，直接重新发送一次 `watch` 即可重建镜像
+- 如果 `watch` 因为读取失败而停止，直接重新发送一次 `watch` 即可重建镜像
 - 如果你不想再持续推送，发 `unwatch` 或 `stop watch`
 - 如果你想改为由 Slack 接管，再发 `control` 或 `takeover`；这时当前 thread 上已有的 `watch` 会自动停止
 
@@ -267,17 +280,20 @@ watch
 
 ## `interrupt` 和 `steer`
 
-- `interrupt` 会读取当前 session 的官方 thread 状态，找到活跃 turn 并发送中断请求
-- `interrupt` 在 `observe` 和 `control` 模式下都可以使用
+- `interrupt` / `steer` 作用于当前由 `codex-slack` runtime 持有的活跃 turn
+- 如果当前只是 `attach` 到一个终端里正在运行的 turn，那么它仍然是 `watch`-only；Slack 不会直接打断或 steer 那一轮
+- `interrupt` 在 `observe` 和 `control` 模式下都可以使用，但前提是当前活跃 turn 已经是由 Slack 这边接管后启动的
 - `steer <text>` 会向当前活跃 turn 追加一条指令
 - `steer` 只在 `control` 模式下可用，避免你在只读镜像模式里意外写入
+- 如果 `server.py` 在某个活跃 turn 运行期间重启，那么该 turn 的 session 绑定仍保留，但 runtime 持有状态不会自动恢复；这时你仍可 `watch`，但对这一个已经在运行的 turn 不能继续 `interrupt` 或 `steer`
+- 等那一轮结束后，在 Slack 里继续发送普通消息启动由 `codex-slack` 接管的新 turn，之后 `interrupt` / `steer` 会再次可用
 - 这两个命令都依赖当前 session 里确实存在活跃 turn；如果当前没有正在运行的 turn，Slack 会直接返回错误说明
 
 ## 附件输入
 
 - 如果你在私聊或 `@bot` thread 里发送图片附件，服务会把图片下载到本地临时目录，并通过 Codex CLI 的 `--image` 传给模型
 - 如果你发送文档类附件，服务会把文件下载到本地临时目录，并把本地文件清单附加到 prompt，让 Codex 直接读取这些路径
-- 文档类附件当前支持常见文本/源码/配置文件，以及 `pdf`、`docx`
+- 文档类附件当前支持常见文本/源码/配置文件，以及 `pdf`、`docx`、`jl`、`ipynb`
 - 如果消息里既有文字也有附件，文字会作为正常 prompt，附件会作为附加输入
 - 如果你只发附件不写文字，服务会自动补一条默认提示，让 Codex 先基于这些附件继续处理
 - 附件下载完成后会在本轮结束后自动清理临时文件
@@ -312,16 +328,17 @@ watch
 运行语法检查和测试：
 
 ```bash
-python3 -m py_compile server.py codex_threads.py session_catalog.py turn_control.py slack_home.py slack_image_inputs.py slack_document_inputs.py tests/test_server.py tests/test_session_catalog.py tests/test_turn_control.py tests/test_slack_home.py tests/test_slack_image_inputs.py tests/test_slack_document_inputs.py
+python3 -m py_compile server.py app_runtime.py codex_threads.py session_catalog.py turn_control.py slack_home.py slack_image_inputs.py slack_document_inputs.py tests/test_server.py tests/test_session_catalog.py tests/test_turn_control.py tests/test_slack_home.py tests/test_slack_image_inputs.py tests/test_slack_document_inputs.py
 python3 -m unittest -q tests.test_server tests.test_session_catalog tests.test_turn_control tests.test_slack_home tests.test_slack_image_inputs tests.test_slack_document_inputs
 ```
 
 ## 文件说明
 
 - `server.py`：Slack Socket Mode 服务和 Codex session 管理
+- `app_runtime.py`：长生命周期 app-server runtime，负责 Slack 接管后的 turn 执行和 live steer / interrupt
 - `codex_threads.py`：官方 app-server thread 读写封装
 - `session_catalog.py`：recent / sessions 列表和 `attach recent <n>` 选择缓存
-- `turn_control.py`：活跃 turn 检测、`interrupt` 和 `steer`
+- `turn_control.py`：活跃 turn 状态辅助和本地 registry
 - `slack_home.py`：App Home 仪表板视图
 - `slack_image_inputs.py`：Slack 图片附件提取、下载和清理
 - `slack_document_inputs.py`：Slack 文档类附件提取、下载和 prompt 注入

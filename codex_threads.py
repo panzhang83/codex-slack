@@ -129,22 +129,28 @@ def create_app_server_client(config: CodexAppServerConfig):
     return CodexClient(transport)
 
 
-async def read_thread_response_async(config: CodexAppServerConfig, session_id):
+async def read_thread_response_async(config: CodexAppServerConfig, session_id, *, include_turns=True):
     client = create_app_server_client(config)
     await client.start()
     await client.initialize()
     try:
-        return await client.read_thread(session_id, include_turns=True)
+        return await client.read_thread(session_id, include_turns=include_turns)
     finally:
         with suppress(Exception):
             await client.close()
 
 
-def read_thread_response(config: CodexAppServerConfig, session_id):
+def read_thread_response(config: CodexAppServerConfig, session_id, *, include_turns=True):
     last_error = None
     for _attempt in range(config.max_retries):
         try:
-            return asyncio.run(read_thread_response_async(config, session_id))
+            return asyncio.run(
+                read_thread_response_async(
+                    config,
+                    session_id,
+                    include_turns=include_turns,
+                )
+            )
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"读取 thread 对话失败: {last_error}")
@@ -244,22 +250,28 @@ def rename_thread(config: CodexAppServerConfig, session_id, title):
     return normalized_title
 
 
-async def interrupt_turn_async(config: CodexAppServerConfig, turn_id):
+async def interrupt_turn_async(config: CodexAppServerConfig, thread_id, turn_id):
     client = create_app_server_client(config)
     await client.start()
     await client.initialize()
     try:
-        return await client.interrupt_turn(turn_id)
+        return await client.request(
+            "turn/interrupt",
+            {
+                "threadId": thread_id,
+                "turnId": turn_id,
+            },
+        )
     finally:
         with suppress(Exception):
             await client.close()
 
 
-def interrupt_turn(config: CodexAppServerConfig, turn_id):
+def interrupt_turn(config: CodexAppServerConfig, thread_id, turn_id):
     last_error = None
     for _attempt in range(config.max_retries):
         try:
-            return asyncio.run(interrupt_turn_async(config, turn_id))
+            return asyncio.run(interrupt_turn_async(config, thread_id, turn_id))
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"中断 turn 失败: {last_error}")
