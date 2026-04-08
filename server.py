@@ -4031,7 +4031,25 @@ def run_runtime_turn_with_updates(
                 session_origin=session_origin,
                 session_cwd=workdir_override,
             )
+        with suppress(Exception):
+            latest_event_key = get_latest_event_key_for_session(started_session_id)
+            if latest_event_key:
+                SESSION_STORE.set_watch_last_event_key(
+                    thread_key,
+                    started_session_id,
+                    latest_event_key,
+                    owner_user_id=owner_user_id,
+                )
     def on_step(step):
+        current_session_id = session_id_tracker.get() or session_id
+        if current_session_id and step.turn_id and step.item_id:
+            with suppress(Exception):
+                SESSION_STORE.set_watch_last_event_key(
+                    thread_key,
+                    current_session_id,
+                    (step.turn_id, step.item_id),
+                    owner_user_id=owner_user_id,
+                )
         if not enable_progress or not step.text or step.item_type != "agentMessage":
             return
         item = step.data.get("item") if isinstance(step.data, dict) else None
@@ -6327,18 +6345,45 @@ def restore_background_watchers(client):
         mode = binding.get("mode") or SESSION_MODE_CONTROL
         persist_watch = bool(binding.get("watch_enabled"))
         stop_when_idle = False
+        persisted_last_event_key = SESSION_STORE.get_watch_last_event_key(
+            thread_key,
+            current_session_id=session_id,
+        )
+        latest_event_key = None
 
         if not persist_watch and mode == SESSION_MODE_CONTROL:
-            if not should_restore_control_recovery_watch(session_id):
-                skipped.append(
-                    {
-                        "thread_key": thread_key,
-                        "session_id": session_id,
-                        "reason": "idle_control_session",
-                    }
-                )
-                continue
+            is_active = should_restore_control_recovery_watch(session_id)
             stop_when_idle = True
+            if not is_active:
+                if not persisted_last_event_key:
+                    skipped.append(
+                        {
+                            "thread_key": thread_key,
+                            "session_id": session_id,
+                            "reason": "idle_control_session",
+                        }
+                    )
+                    continue
+                try:
+                    latest_event_key = get_latest_event_key_for_session(session_id)
+                except Exception as exc:
+                    skipped.append(
+                        {
+                            "thread_key": thread_key,
+                            "session_id": session_id,
+                            "reason": f"read_failed: {truncate_text(str(exc), max_length=120)}",
+                        }
+                    )
+                    continue
+                if latest_event_key == persisted_last_event_key:
+                    skipped.append(
+                        {
+                            "thread_key": thread_key,
+                            "session_id": session_id,
+                            "reason": "idle_control_session_no_backlog",
+                        }
+                    )
+                    continue
         elif not persist_watch:
             skipped.append(
                 {
@@ -6349,22 +6394,22 @@ def restore_background_watchers(client):
             )
             continue
 
-        persisted_last_event_key = SESSION_STORE.get_watch_last_event_key(
-            thread_key,
-            current_session_id=session_id,
-        )
         cursor_source = "persisted" if persisted_last_event_key else "latest"
-        try:
-            last_event_key = persisted_last_event_key or get_latest_event_key_for_session(session_id)
-        except Exception as exc:
-            skipped.append(
-                {
-                    "thread_key": thread_key,
-                    "session_id": session_id,
-                    "reason": f"read_failed: {truncate_text(str(exc), max_length=120)}",
-                }
-            )
-            continue
+        if persisted_last_event_key:
+            last_event_key = persisted_last_event_key
+        else:
+            try:
+                latest_event_key = latest_event_key or get_latest_event_key_for_session(session_id)
+            except Exception as exc:
+                skipped.append(
+                    {
+                        "thread_key": thread_key,
+                        "session_id": session_id,
+                        "reason": f"read_failed: {truncate_text(str(exc), max_length=120)}",
+                    }
+                )
+                continue
+            last_event_key = latest_event_key
 
         start_watcher(
             client,

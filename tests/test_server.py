@@ -1353,6 +1353,34 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertEqual(restored["skipped"][0]["reason"], "idle_control_session")
         start_watcher.assert_not_called()
 
+    def test_restore_background_watchers_backfills_idle_control_session_when_backlog_exists(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        self.store.set_watch_last_event_key(
+            self.thread_key,
+            self.session_id,
+            ("turn-old", "a-old"),
+            owner_user_id=self.user_id,
+        )
+
+        with patch.object(server, "should_restore_control_recovery_watch", return_value=False):
+            with patch.object(server, "get_latest_event_key_for_session", return_value=("turn-new", "a-new")):
+                with patch.object(server, "start_watcher") as start_watcher:
+                    restored = server.restore_background_watchers(self.client)
+
+        self.assertEqual(restored["restored_count"], 1)
+        self.assertEqual(restored["restored"][0]["cursor_source"], "persisted")
+        start_watcher.assert_called_once_with(
+            self.client,
+            self.channel,
+            self.thread_ts,
+            self.thread_key,
+            self.session_id,
+            last_event_key=("turn-old", "a-old"),
+            persist_watch=False,
+            stop_when_idle=True,
+        )
+
     def test_watch_rejects_extra_arguments(self):
         server.process_prompt(self.client, self.channel, self.thread_ts, "watch raw", self.user_id)
         self.assertIn("不再接受参数", self.client.messages[0]["text"])
