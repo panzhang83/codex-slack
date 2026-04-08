@@ -1,7 +1,9 @@
+import asyncio
 import concurrent.futures
 import os
 import ssl
 import tempfile
+import threading
 import time
 import urllib.error
 import unittest
@@ -1053,6 +1055,79 @@ class ProgressExtractionTests(unittest.TestCase):
         progress_messages = [message["text"] for message in client.messages if "Codex Progress" in message["text"]]
         self.assertEqual(progress_messages, ["*Codex Progress*\n> 正在检查测试并准备修复。"])
 
+    def test_run_runtime_turn_with_updates_persists_only_conversation_event_cursor(self):
+        discovered_session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        store = server.SlackThreadSessionStore(Path(tmpdir.name) / "sessions.json")
+        thread_key = "C1:1"
+        channel = "C1"
+        thread_ts = "1"
+        user_id = "U111"
+
+        class FakeRuntime:
+            def run_turn(
+                self,
+                *,
+                session_id=None,
+                input_items=None,
+                thread_config=None,
+                turn_overrides=None,
+                collaboration_mode=None,
+                heartbeat_seconds=None,
+                on_turn_started=None,
+                on_step=None,
+                on_heartbeat=None,
+                on_user_input_request=None,
+            ):
+                on_turn_started(discovered_session_id, "turn-1")
+                on_step(
+                    ns(
+                        text="进度说明",
+                        step_type="codex",
+                        item_type="agentMessage",
+                        data={"item": {"phase": "commentary"}},
+                        turn_id="turn-1",
+                        item_id="a1",
+                    )
+                )
+                on_step(
+                    ns(
+                        text="最终答案",
+                        step_type="codex",
+                        item_type="agentMessage",
+                        data={"item": {"phase": "final_answer"}},
+                        turn_id="turn-1",
+                        item_id="a2",
+                    )
+                )
+                return ns(
+                    session_id=discovered_session_id,
+                    final_text="done",
+                    steps=[],
+                )
+
+        with patch.object(server, "SESSION_STORE", store):
+            with patch.object(server, "get_app_runtime", return_value=FakeRuntime()):
+                server.run_runtime_turn_with_updates(
+                    DummyClient(),
+                    channel,
+                    thread_ts,
+                    thread_key,
+                    "continue",
+                    session_id=None,
+                    enable_progress=False,
+                    owner_user_id=user_id,
+                )
+
+        self.assertEqual(
+            store.get_watch_last_event_key(
+                thread_key,
+                current_session_id=discovered_session_id,
+            ),
+            ("turn-1", "a2"),
+        )
+
     def test_run_runtime_turn_with_updates_uses_reporter_and_flushes_before_return(self):
         discovered_session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
 
@@ -1379,6 +1454,78 @@ class ProcessPromptTests(unittest.TestCase):
             last_event_key=("turn-old", "a-old"),
             persist_watch=False,
             stop_when_idle=True,
+        )
+
+    def test_watch_loop_async_backfills_backlog_immediately_after_restore(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+
+        metadata_response = object()
+        thread_response = object()
+        stop_event = threading.Event()
+        posted_messages = []
+
+        class FakeWatchClient:
+            async def start(self):
+                return None
+
+            async def initialize(self):
+                return None
+
+            async def close(self):
+                return None
+
+        async def run_test():
+            with patch.object(server, "create_app_server_client", return_value=FakeWatchClient()):
+                with patch.object(
+                    server,
+                    "_read_thread_response_with_client",
+                    side_effect=[metadata_response, metadata_response, thread_response],
+                ):
+                    with patch.object(
+                        server,
+                        "extract_watch_thread_snapshot",
+                        return_value=server.WatchThreadSnapshot(
+                            path=None,
+                            updated_at=1,
+                            status_type="idle",
+                        ),
+                    ):
+                        with patch.object(
+                            server,
+                            "advance_watch_cursor",
+                            return_value=("补发的缺失消息", ("turn-1", "a2"), False),
+                        ):
+                            with patch.object(
+                                server,
+                                "_wait_for_watch_signal",
+                                side_effect=AssertionError("initial sync should not wait for signal"),
+                            ):
+                                with patch.object(
+                                    server,
+                                    "post_chunks",
+                                    side_effect=lambda *args: posted_messages.append(args[3]),
+                                ):
+                                    await server.watch_loop_async(
+                                        self.client,
+                                        self.channel,
+                                        self.thread_ts,
+                                        self.thread_key,
+                                        self.session_id,
+                                        stop_event,
+                                        last_event_key=("turn-1", "a1"),
+                                        stop_when_idle=True,
+                                    )
+
+        asyncio.run(run_test())
+
+        self.assertEqual(posted_messages, ["补发的缺失消息"])
+        self.assertEqual(
+            self.store.get_watch_last_event_key(
+                self.thread_key,
+                current_session_id=self.session_id,
+            ),
+            ("turn-1", "a2"),
         )
 
     def test_watch_rejects_extra_arguments(self):

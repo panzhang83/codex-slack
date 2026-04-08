@@ -3942,6 +3942,20 @@ def format_progress_message(text):
     return thread_views.format_progress_message(text)
 
 
+def get_runtime_step_conversation_event_key(step):
+    if not step or not getattr(step, "turn_id", None) or not getattr(step, "item_id", None):
+        return None
+    if getattr(step, "item_type", None) != "agentMessage":
+        return None
+    data = step.data if isinstance(step.data, dict) else {}
+    item = data.get("item") if isinstance(data, dict) else None
+    if not isinstance(item, dict):
+        return None
+    if not is_final_answer_phase(item.get("phase")):
+        return None
+    return (step.turn_id, step.item_id)
+
+
 def build_progress_messages(progress_events, previous_text_by_item_id):
     return thread_views.build_progress_messages(progress_events, previous_text_by_item_id)
 
@@ -4050,12 +4064,13 @@ def run_runtime_turn_with_updates(
                 )
     def on_step(step):
         current_session_id = session_id_tracker.get() or session_id
-        if current_session_id and step.turn_id and step.item_id:
+        conversation_event_key = get_runtime_step_conversation_event_key(step)
+        if current_session_id and conversation_event_key:
             with suppress(Exception):
                 SESSION_STORE.set_watch_last_event_key(
                     thread_key,
                     current_session_id,
-                    (step.turn_id, step.item_id),
+                    conversation_event_key,
                     owner_user_id=owner_user_id,
                 )
                 print(
@@ -4063,7 +4078,7 @@ def run_runtime_turn_with_updates(
                     f" thread_key={thread_key}"
                     f" session_id={current_session_id}"
                     f" source=step"
-                    f" event_key={(step.turn_id, step.item_id)}",
+                    f" event_key={conversation_event_key}",
                     flush=True,
                 )
         if not enable_progress or not step.text or step.item_type != "agentMessage":
@@ -4583,6 +4598,7 @@ async def watch_loop_async(
     watch_client = create_app_server_client()
     watch_id = None
     last_snapshot = None
+    force_initial_sync = True
 
     try:
         await watch_client.start()
@@ -4610,16 +4626,20 @@ async def watch_loop_async(
             if SESSION_STORE.get(thread_key) != session_id:
                 break
 
-            timeout_seconds = metadata_fallback_seconds if watch_id else poll_seconds
-            signal = await _wait_for_watch_signal(
-                watch_client,
-                watch_id,
-                stop_event,
-                timeout_seconds,
-                debounce_seconds,
-            )
-            if signal == "stopped":
-                break
+            if force_initial_sync:
+                signal = "initial_sync"
+                force_initial_sync = False
+            else:
+                timeout_seconds = metadata_fallback_seconds if watch_id else poll_seconds
+                signal = await _wait_for_watch_signal(
+                    watch_client,
+                    watch_id,
+                    stop_event,
+                    timeout_seconds,
+                    debounce_seconds,
+                )
+                if signal == "stopped":
+                    break
             if SESSION_STORE.get(thread_key) != session_id:
                 break
 
@@ -4662,7 +4682,7 @@ async def watch_loop_async(
                     except Exception:
                         watch_id = None
 
-            if not (updated or status_changed or path_changed or signal == "fs_changed"):
+            if not (updated or status_changed or path_changed or signal in {"fs_changed", "initial_sync"}):
                 last_snapshot = snapshot
                 continue
 
