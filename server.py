@@ -873,26 +873,17 @@ class SlackThreadSessionStore:
         plan_text,
         session_id=None,
         owner_user_id=None,
-        recommended_execution_mode=None,
     ):
         normalized_plan_text = normalize_plan_text(plan_text)
         if not normalized_plan_text:
             return
-        normalized_recommended_execution_mode = normalize_plan_execution_mode(
-            recommended_execution_mode
-        )
         with self._lock:
             existing_entry = dict(self._sessions.get(key, {}))
             existing_entry["latest_plan_text"] = normalized_plan_text
             normalized_session_id = str(session_id or "").strip()
             if normalized_session_id:
                 existing_entry["latest_plan_session_id"] = normalized_session_id
-            if normalized_recommended_execution_mode:
-                existing_entry["latest_plan_recommended_execution_mode"] = (
-                    normalized_recommended_execution_mode
-                )
-            else:
-                existing_entry.pop("latest_plan_recommended_execution_mode", None)
+            existing_entry.pop("latest_plan_recommended_execution_mode", None)
             existing_entry.pop("latest_plan_selected_action", None)
             existing_entry["updated_at"] = int(time.time())
             effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
@@ -1700,13 +1691,11 @@ def persist_latest_proposed_plan(thread_key, result_text, session_id=None, owner
     plan_text = extract_latest_proposed_plan(result_text)
     if not plan_text:
         return None
-    recommended_execution_mode = extract_latest_implementation_recommendation(result_text)
     SESSION_STORE.set_latest_plan(
         thread_key,
         plan_text,
         session_id=session_id,
         owner_user_id=owner_user_id,
-        recommended_execution_mode=recommended_execution_mode,
     )
     return plan_text
 
@@ -1972,15 +1961,11 @@ def get_plan_state_lines(thread_key, session_store=None):
     latest_plan_session_id = session_store.get_latest_plan_session_id(thread_key)
     latest_plan_execution_mode = session_store.get_latest_plan_execution_mode(thread_key)
     latest_plan_execution_session_id = session_store.get_latest_plan_execution_session_id(thread_key)
-    latest_plan_recommended_execution_mode = session_store.get_latest_plan_recommended_execution_mode(
-        thread_key
-    )
     latest_plan_selected_action = session_store.get_latest_plan_selected_action(thread_key)
     latest_plan_approved_at = session_store.get_latest_plan_approved_at(thread_key)
     latest_plan_text = session_store.get_latest_plan(thread_key)
     return [
         f"- latest_plan_session_id: `{latest_plan_session_id or '-'}`",
-        f"- latest_plan_recommended_execution_mode: `{latest_plan_recommended_execution_mode or '-'}`",
         f"- latest_plan_selected_action: `{latest_plan_selected_action or '-'}`",
         f"- latest_plan_execution_mode: `{latest_plan_execution_mode or '-'}`",
         f"- latest_plan_execution_session_id: `{latest_plan_execution_session_id or '-'}`",
@@ -2643,12 +2628,10 @@ def post_thread_collaboration_mode_message(client, channel, thread_ts, thread_ke
 
 
 def build_thread_plan_actions_message(thread_key, session_id=None, footer_note=None):
-    latest_plan_text = SESSION_STORE.get_latest_plan(thread_key)
     plan_session_id = SESSION_STORE.get_latest_plan_session_id(thread_key) or session_id or "-"
     approved_at = SESSION_STORE.get_latest_plan_approved_at(thread_key)
     execution_mode = SESSION_STORE.get_latest_plan_execution_mode(thread_key)
     execution_session_id = SESSION_STORE.get_latest_plan_execution_session_id(thread_key)
-    recommended_execution_mode = SESSION_STORE.get_latest_plan_recommended_execution_mode(thread_key)
     selected_action = SESSION_STORE.get_latest_plan_selected_action(thread_key)
     current_mode = resolve_collaboration_mode(thread_key)
     lines = [
@@ -2657,10 +2640,6 @@ def build_thread_plan_actions_message(thread_key, session_id=None, footer_note=N
         f"Planning session: `{plan_session_id}`",
         f"Current collaboration mode: `{format_collaboration_mode_label(current_mode)}`",
     ]
-    if latest_plan_text:
-        lines.append(f"Plan preview: `{sanitize_inline_code_text(latest_plan_text, max_length=120)}`")
-    if recommended_execution_mode and selected_action not in {"clean", "here"}:
-        lines.append(f"Recommended execution: `{recommended_execution_mode}`")
     if execution_mode and execution_session_id:
         lines.append(
             "Last implementation: "
@@ -2683,24 +2662,14 @@ def build_thread_plan_actions_message(thread_key, session_id=None, footer_note=N
                     "action_id": THREAD_PLAN_IMPLEMENT_CLEAN_ACTION,
                     "text": {"type": "plain_text", "text": "Implement clean"},
                     "value": encode_thread_plan_action_value(thread_key, "clean"),
-                    "style": (
-                        "primary"
-                        if selected_action == "clean"
-                        or (not selected_action and recommended_execution_mode == "clean")
-                        else None
-                    ),
+                    "style": "primary" if selected_action == "clean" else None,
                 },
                 {
                     "type": "button",
                     "action_id": THREAD_PLAN_IMPLEMENT_HERE_ACTION,
                     "text": {"type": "plain_text", "text": "Implement here"},
                     "value": encode_thread_plan_action_value(thread_key, "here"),
-                    "style": (
-                        "primary"
-                        if selected_action == "here"
-                        or (not selected_action and recommended_execution_mode == "here")
-                        else None
-                    ),
+                    "style": "primary" if selected_action == "here" else None,
                 },
                 {
                     "type": "button",
@@ -2763,11 +2732,7 @@ def build_plan_refinement_prompt(plan_text):
         "- 先不要开始实施\n"
         "- 结合当前 thread 里已经出现的补充、约束或新信息继续细化\n"
         "- 即使总体方向不变，也请输出一版完整更新后的 `<proposed_plan>`，不要只给口头说明\n"
-        "- 如果你能明确判断更适合 `Implement clean` 还是 `Implement here`，就在完整的 `<proposed_plan>` 后额外输出"
-        " `<implementation_recommendation>clean</implementation_recommendation>` 或"
-        " `<implementation_recommendation>here</implementation_recommendation>`\n"
-        "- 绝对不要单独输出 `<implementation_recommendation>`；只要输出 recommendation，就必须同时输出完整 `<proposed_plan>...</proposed_plan>`\n"
-        "- 如果没有明确推荐，就不要输出 `<implementation_recommendation>`\n\n"
+        "- 如果是在正式给方案，就直接输出完整 `<proposed_plan>...</proposed_plan>`\n\n"
         "Current approved plan:\n"
         f"{plan_text}"
     )
@@ -2779,12 +2744,7 @@ def build_plan_mode_prompt(prompt):
         return normalized_prompt
     return (
         f"{normalized_prompt}\n\n"
-        "如果这次回复要给出方案，请输出完整 `<proposed_plan>...</proposed_plan>`，并额外遵守以下约定：\n"
-        "- 如能明确判断更适合 `Implement clean` 还是 `Implement here`，就在完整的 `<proposed_plan>` 后追加"
-        " `<implementation_recommendation>clean</implementation_recommendation>` 或"
-        " `<implementation_recommendation>here</implementation_recommendation>`\n"
-        "- 绝对不要单独输出 `<implementation_recommendation>`；只要输出 recommendation，就必须同时输出完整 `<proposed_plan>...</proposed_plan>`\n"
-        "- 如果没有明确推荐，就不要输出 `<implementation_recommendation>`"
+        "如果这次回复是在正式给方案，请直接输出完整 `<proposed_plan>...</proposed_plan>`。"
     )
 
 
@@ -6634,6 +6594,18 @@ def build_app():
                 "keep_planning",
                 owner_user_id=user_id,
             )
+            text, blocks = build_thread_plan_actions_message(
+                thread_key,
+                session_id=SESSION_STORE.get(thread_key),
+            )
+            with suppress(Exception):
+                if channel_id and message_ts:
+                    client.chat_update(
+                        channel=channel_id,
+                        ts=message_ts,
+                        text=text,
+                        blocks=blocks,
+                    )
             handle_keep_planning_action(
                 client,
                 channel_id,
@@ -6650,6 +6622,18 @@ def build_app():
             execution_mode,
             owner_user_id=user_id,
         )
+        text, blocks = build_thread_plan_actions_message(
+            thread_key,
+            session_id=SESSION_STORE.get(thread_key),
+        )
+        with suppress(Exception):
+            if channel_id and message_ts:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=message_ts,
+                    text=text,
+                    blocks=blocks,
+                )
         start_text = (
             f"<@{user_id}> 正在按已批准的方案开始实施（`{execution_mode}`），请稍等。"
         )

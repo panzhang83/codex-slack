@@ -2202,10 +2202,11 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertIn("<proposed_plan>", self.client.messages[1]["text"])
         self.assertIn("*Approved Plan*", self.client.messages[2]["blocks"][0]["text"]["text"])
 
-    def test_plan_mode_prompt_requires_full_plan_before_recommendation(self):
+    def test_plan_mode_prompt_requires_full_plan_only(self):
         prompt = server.build_plan_mode_prompt("请先给方案")
 
-        self.assertIn("只要输出 recommendation，就必须同时输出完整 `<proposed_plan>...</proposed_plan>`", prompt)
+        self.assertIn("请直接输出完整 `<proposed_plan>...</proposed_plan>`", prompt)
+        self.assertNotIn("<implementation_recommendation>", prompt)
 
     def test_process_prompt_in_plan_mode_strips_recommendation_only_tag_from_visible_output(self):
         self.store.set_collaboration_mode(
@@ -2265,7 +2266,7 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertNotIn("style", button_by_id[server.THREAD_PLAN_IMPLEMENT_HERE_ACTION])
         self.assertEqual(button_by_id[server.THREAD_PLAN_KEEP_PLANNING_ACTION]["text"]["text"], "Keep planning")
 
-    def test_persist_latest_proposed_plan_stores_agent_recommendation(self):
+    def test_persist_latest_proposed_plan_does_not_store_agent_recommendation(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
 
         plan_text = server.persist_latest_proposed_plan(
@@ -2276,31 +2277,14 @@ class ProcessPromptTests(unittest.TestCase):
         )
 
         self.assertEqual(plan_text, "hello")
-        self.assertEqual(self.store.get_latest_plan_recommended_execution_mode(self.thread_key), "clean")
+        self.assertIsNone(self.store.get_latest_plan_recommended_execution_mode(self.thread_key))
         self.assertIsNone(self.store.get_latest_plan_selected_action(self.thread_key))
 
-    def test_build_thread_plan_actions_message_highlights_agent_recommendation(self):
+    def test_build_thread_plan_actions_message_highlights_selected_action(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
-        server.persist_latest_proposed_plan(
+        self.store.set_latest_plan(
             self.thread_key,
-            "<proposed_plan>\nhello\n</proposed_plan>\n<implementation_recommendation>here</implementation_recommendation>",
-            session_id=self.session_id,
-            owner_user_id=self.user_id,
-        )
-
-        text, blocks = server.build_thread_plan_actions_message(self.thread_key, session_id=self.session_id)
-
-        self.assertIn("Recommended execution: `here`", text)
-        button_by_id = {element["action_id"]: element for element in blocks[1]["elements"]}
-        self.assertNotIn("style", button_by_id[server.THREAD_PLAN_IMPLEMENT_CLEAN_ACTION])
-        self.assertEqual(button_by_id[server.THREAD_PLAN_IMPLEMENT_HERE_ACTION]["style"], "primary")
-        self.assertNotIn("style", button_by_id[server.THREAD_PLAN_KEEP_PLANNING_ACTION])
-
-    def test_build_thread_plan_actions_message_selected_action_overrides_recommendation(self):
-        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
-        server.persist_latest_proposed_plan(
-            self.thread_key,
-            "<proposed_plan>\nhello\n</proposed_plan>\n<implementation_recommendation>clean</implementation_recommendation>",
+            "<proposed_plan>\nhello\n</proposed_plan>",
             session_id=self.session_id,
             owner_user_id=self.user_id,
         )
@@ -2312,6 +2296,7 @@ class ProcessPromptTests(unittest.TestCase):
         button_by_id = {element["action_id"]: element for element in blocks[1]["elements"]}
         self.assertNotIn("style", button_by_id[server.THREAD_PLAN_IMPLEMENT_CLEAN_ACTION])
         self.assertEqual(button_by_id[server.THREAD_PLAN_IMPLEMENT_HERE_ACTION]["style"], "primary")
+        self.assertNotIn("style", button_by_id[server.THREAD_PLAN_KEEP_PLANNING_ACTION])
 
     def test_persist_latest_proposed_plan_clears_previous_selected_action(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
@@ -2331,7 +2316,7 @@ class ProcessPromptTests(unittest.TestCase):
         )
 
         self.assertIsNone(self.store.get_latest_plan_selected_action(self.thread_key))
-        self.assertEqual(self.store.get_latest_plan_recommended_execution_mode(self.thread_key), "here")
+        self.assertIsNone(self.store.get_latest_plan_recommended_execution_mode(self.thread_key))
 
     def test_continue_planning_action_runs_new_plan_turn_and_posts_updated_card(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
@@ -2361,11 +2346,11 @@ class ProcessPromptTests(unittest.TestCase):
                 self.thread_key,
                 user_id=self.user_id,
                 logger=MagicMock(),
-            )
+        )
 
         self.assertEqual(run_runtime_turn.call_args.kwargs["collaboration_mode"], server.COLLABORATION_MODE_PLAN)
         self.assertIn("请继续细化这份已批准方案", run_runtime_turn.call_args.args[4])
-        self.assertIn("<implementation_recommendation>", run_runtime_turn.call_args.args[4])
+        self.assertNotIn("<implementation_recommendation>", run_runtime_turn.call_args.args[4])
         self.assertTrue(any("正在继续细化这份方案" in message["text"] for message in self.client.messages))
         self.assertTrue(any("已继续在当前 planning session 中细化方案" in message["text"] for message in self.client.messages))
         self.assertTrue(any(message.get("blocks") and "*Approved Plan*" in message["blocks"][0]["text"]["text"] for message in self.client.messages))
