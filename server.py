@@ -5973,11 +5973,19 @@ def get_home_bindings_rows(user_id, limit=5):
     raw_rows = SESSION_STORE.list_for_owner(user_id, limit=limit)
     rows = []
     for row in raw_rows:
+        thread_key = row.get("thread_key", "")
+        stored_session_id = row.get("session_id", "")
+        active_record = ACTIVE_TURN_REGISTRY.get_for_thread(thread_key)
+        effective_session_id = (
+            active_record.session_id
+            if active_record and getattr(active_record, "session_id", None)
+            else stored_session_id
+        )
         fallback_label = get_home_binding_label(row.get("thread_key", ""))
-        title = get_thread_display_title(row.get("session_id", ""))
+        title = get_thread_display_title(effective_session_id)
         pending_target = SESSION_STORE.get_pending_subagent_target(
-            row.get("thread_key", ""),
-            current_session_id=row.get("session_id", ""),
+            thread_key,
+            current_session_id=effective_session_id,
             owner_user_id=user_id,
         )
         status_text = fallback_label if title and title != fallback_label else None
@@ -5992,7 +6000,7 @@ def get_home_bindings_rows(user_id, limit=5):
         rows.append(
             {
                 "label": title or fallback_label,
-                "session_id": row.get("session_id", "-"),
+                "session_id": effective_session_id or "-",
                 "mode": row.get("mode", "-"),
                 "cwd": row.get("cwd", "-"),
                 "updated_at": format_home_timestamp(row.get("updated_at")),
@@ -6000,8 +6008,8 @@ def get_home_bindings_rows(user_id, limit=5):
                 "action_id": "binding_rename_open",
                 "action_text": "Rename",
                 "action_value": encode_home_binding_value(
-                    row.get("thread_key", ""),
-                    row.get("session_id", ""),
+                    thread_key,
+                    effective_session_id,
                 ),
             }
         )

@@ -241,6 +241,20 @@ class ServerAppHomeHelpersTests(unittest.TestCase):
         self.assertEqual(rows[0]["thread_id"], "-")
         self.assertIn("boom", rows[0]["title"])
 
+    def test_get_home_bindings_rows_prefers_active_turn_session_id(self):
+        server.SESSION_STORE.set("D1:1", "sess-old", owner_user_id="U123", session_cwd="/repo")
+        server.ACTIVE_TURN_REGISTRY.set("D1:1", "sess-new", "turn-1")
+        try:
+            with patch.object(server, "get_thread_display_title", return_value="new thread"):
+                rows = server.get_home_bindings_rows("U123", limit=5)
+        finally:
+            server.ACTIVE_TURN_REGISTRY.clear_for_thread("D1:1")
+            server.SESSION_STORE.delete("D1:1")
+
+        self.assertEqual(rows[0]["session_id"], "sess-new")
+        self.assertEqual(rows[0]["label"], "new thread")
+        self.assertEqual(rows[0]["action_value"], "{\"thread_key\":\"D1:1\",\"session_id\":\"sess-new\"}")
+
     def test_publish_home_view_calls_views_publish(self):
         client = DummyViewClient()
         with patch.object(server, "get_home_bindings_rows", return_value=[]):
