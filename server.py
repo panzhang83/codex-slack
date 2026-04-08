@@ -4040,6 +4040,14 @@ def run_runtime_turn_with_updates(
                     latest_event_key,
                     owner_user_id=owner_user_id,
                 )
+                print(
+                    "[watch_cursor_update]"
+                    f" thread_key={thread_key}"
+                    f" session_id={started_session_id}"
+                    f" source=turn_started"
+                    f" event_key={latest_event_key}",
+                    flush=True,
+                )
     def on_step(step):
         current_session_id = session_id_tracker.get() or session_id
         if current_session_id and step.turn_id and step.item_id:
@@ -4049,6 +4057,14 @@ def run_runtime_turn_with_updates(
                     current_session_id,
                     (step.turn_id, step.item_id),
                     owner_user_id=owner_user_id,
+                )
+                print(
+                    "[watch_cursor_update]"
+                    f" thread_key={thread_key}"
+                    f" session_id={current_session_id}"
+                    f" source=step"
+                    f" event_key={(step.turn_id, step.item_id)}",
+                    flush=True,
                 )
         if not enable_progress or not step.text or step.item_type != "agentMessage":
             return
@@ -6361,6 +6377,9 @@ def restore_background_watchers(client):
                             "thread_key": thread_key,
                             "session_id": session_id,
                             "reason": "idle_control_session",
+                            "persisted_last_event_key": persisted_last_event_key,
+                            "latest_event_key": latest_event_key,
+                            "is_active": is_active,
                         }
                     )
                     continue
@@ -6372,6 +6391,9 @@ def restore_background_watchers(client):
                             "thread_key": thread_key,
                             "session_id": session_id,
                             "reason": f"read_failed: {truncate_text(str(exc), max_length=120)}",
+                            "persisted_last_event_key": persisted_last_event_key,
+                            "latest_event_key": latest_event_key,
+                            "is_active": is_active,
                         }
                     )
                     continue
@@ -6381,6 +6403,9 @@ def restore_background_watchers(client):
                             "thread_key": thread_key,
                             "session_id": session_id,
                             "reason": "idle_control_session_no_backlog",
+                            "persisted_last_event_key": persisted_last_event_key,
+                            "latest_event_key": latest_event_key,
+                            "is_active": is_active,
                         }
                     )
                     continue
@@ -6390,6 +6415,9 @@ def restore_background_watchers(client):
                     "thread_key": thread_key,
                     "session_id": session_id,
                     "reason": "watch_not_enabled",
+                    "persisted_last_event_key": persisted_last_event_key,
+                    "latest_event_key": latest_event_key,
+                    "is_active": None,
                 }
             )
             continue
@@ -6430,6 +6458,9 @@ def restore_background_watchers(client):
                 "stop_when_idle": stop_when_idle,
                 "cursor_source": cursor_source,
                 "last_event_key": last_event_key,
+                "persisted_last_event_key": persisted_last_event_key,
+                "latest_event_key": latest_event_key,
+                "is_active": None if persist_watch else should_restore_control_recovery_watch(session_id),
             }
         )
     return {
@@ -7112,6 +7143,9 @@ def build_app():
                 f" stop_when_idle={row.get('stop_when_idle')}"
                 f" cursor_source={row.get('cursor_source')}"
                 f" last_event_key={row.get('last_event_key')}",
+                f" persisted_last_event_key={row.get('persisted_last_event_key')}",
+                f" latest_event_key={row.get('latest_event_key')}",
+                f" is_active={row.get('is_active')}",
                 flush=True,
             )
         for row in restore_result.get("skipped", []):
@@ -7119,7 +7153,10 @@ def build_app():
                 "[watcher_restore_skip]"
                 f" thread_key={row.get('thread_key')}"
                 f" session_id={row.get('session_id')}"
-                f" reason={row.get('reason')}",
+                f" reason={row.get('reason')}"
+                f" persisted_last_event_key={row.get('persisted_last_event_key')}"
+                f" latest_event_key={row.get('latest_event_key')}"
+                f" is_active={row.get('is_active')}",
                 flush=True,
             )
 
